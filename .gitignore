@@ -1,0 +1,14 @@
+build/
+screenshot/
+nametag/
+video/
+dist/
+test/
+*__pycache__/
+*.log
+*.DS_Store
+*.prof
+*.config_tmp.yaml
+*config_custom.yaml
+*.exe
+*.spec

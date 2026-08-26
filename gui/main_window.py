@@ -1,0 +1,661 @@
+# -*- coding: utf-8 -*-
+# @Time    : 26/8/26 20:03
+# @Author  : yy
+# @File    : main_window.py
+# @Software: MxdAutoLvup
+
+"""枫叶挂机控制台 · 主界面"""
+import os, time, queue
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox
+import cv2
+from PIL import Image, ImageTk
+
+from gui.theme import *
+from gui.widgets import NeoButton, Bar, KeyEntry
+from gui.region_selector import RegionSelector
+from gui.route_editor import RouteEditor
+from core.config_manager import ConfigManager, TEMPLATE_DIR
+from core.bot_engine import BotEngine, Mode
+from core.window_capture import WindowCapture
+
+
+class App(tk.Tk):
+    PREVIEW_W, PREVIEW_H = 760, 430
+    KEY_ROWS = [
+        ("普通攻击", "attack"), ("技能1", "skill1"), ("技能2", "skill2"), ("技能3", "skill3"),
+        ("红药", "hp_potion"), ("蓝药", "mp_potion"),
+        ("左移", "move_left"), ("右移", "move_right"), ("跳跃", "jump"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.title("枫叶挂机控制台 · MapleStory Auto Level Up")
+        self.configure(bg=BG)
+        self.geometry("1280x800")
+        self.minsize(1180, 740)
+
+        self.cfg_mgr = ConfigManager()
+        self.cfg = self.cfg_mgr.cfg
+        self.log_queue = queue.Queue()
+        self._pv_photo = None
+        self._pill_state = None
+
+        self.engine = BotEngine(self.cfg, lambda m, lv="info": self.log_queue.put(
+            (time.strftime("%H:%M:%S"), m, lv)))
+        self.engine.start()
+
+        self._build_style()
+        self._build_layout()
+        self._poll_status()
+        self._poll_log()
+        self.bind("<F8>", self.toggle_run)
+        self.bind("<F9>", self.toggle_pause)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.log("控制台就绪：① 绑定窗口 → ② 校准血蓝条/框选模板 → ③ 检查按键 → ④ ▶ 启动", "ok")
+
+    # ================= 样式 =================
+    def _build_style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure(".", background=BG, foreground=TEXT, bordercolor=BORDER,
+                    troughcolor="#0a0c12", fieldbackground=PANEL_2,
+                    lightcolor=PANEL_2, darkcolor=PANEL_2)
+        s.configure("TNotebook", background=PANEL, borderwidth=0, tabmargins=(6, 6, 6, 0))
+        s.configure("TNotebook.Tab", background=PANEL_2, foreground=TEXT_DIM,
+                    padding=(14, 7), font=(FONT, 10))
+        s.map("TNotebook.Tab", background=[("selected", ACCENT)],
+              foreground=[("selected", "#16181f")])
+        s.configure("TScale", background=PANEL_2)
+        s.configure("TCombobox", fieldbackground=PANEL_2, background=PANEL_2,
+                    foreground=TEXT, arrowcolor=TEXT)
+        s.map("TCombobox", fieldbackground=[("readonly", PANEL_2)],
+              foreground=[("readonly", TEXT)])
+        self.option_add("*TCombobox*Listbox*Background", PANEL_2)
+        self.option_add("*TCombobox*Listbox*Foreground", TEXT)
+        self.option_add("*TCombobox*Listbox*selectBackground", ACCENT)
+        self.option_add("*TCombobox*Listbox*selectForeground", "#16181f")
+
+    # ================= 布局 =================
+    def _build_layout(self):
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=18, pady=(14, 8))
+        tk.Label(header, text="🍁 枫叶挂机控制台", font=(FONT, 16, "bold"),
+                 bg=BG, fg=TEXT).pack(side="left")
+        tk.Label(header, text="  窗口截图 · 模板识别 · 自动战斗 · 资源监控",
+                 font=(FONT, 9), bg=BG, fg=TEXT_DIM).pack(side="left", pady=(8, 0))
+        self._build_pill(header)
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, bg=PANEL, width=352)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        left.pack_propagate(False)
+        right = tk.Frame(body, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        self._build_left(left)
+        self._build_right(right)
+
+    def _build_pill(self, parent):
+        f = tk.Frame(parent, bg=PANEL_2, padx=12, pady=5)
+        f.pack(side="right")
+        self.pill_dot = tk.Canvas(f, width=10, height=10, bg=PANEL_2, highlightthickness=0)
+        self.pill_dot.pack(side="left")
+        self.pill_lbl = tk.Label(f, text="待机", bg=PANEL_2, fg=TEXT_DIM,
+                                 font=(FONT, 10, "bold"))
+        self.pill_lbl.pack(side="left", padx=(6, 0))
+
+    def _section(self, parent, title):
+        box = tk.Frame(parent, bg=PANEL_2, padx=10, pady=8,
+                       highlightthickness=1, highlightbackground=BORDER)
+        tk.Label(box, text=title, bg=PANEL_2, fg=ACCENT,
+                 font=(FONT, 10, "bold")).pack(anchor="w")
+        body = tk.Frame(box, bg=PANEL_2)
+        body.pack(fill="x", pady=(6, 0))
+        return box, body
+
+    # ---------- 左侧：配置面板 ----------
+    def _build_left(self, left):
+        nb = ttk.Notebook(left)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        t1 = tk.Frame(nb, bg=PANEL); nb.add(t1, text=" 🎯 目标 ")
+        t2 = tk.Frame(nb, bg=PANEL); nb.add(t2, text=" ⌨ 按键 ")
+        t3 = tk.Frame(nb, bg=PANEL); nb.add(t3, text=" ⚙ 参数 ")
+        self._build_target_tab(t1)
+        self._build_key_tab(t2)
+        self._build_param_tab(t3)
+
+        ctrl = tk.Frame(left, bg=PANEL)
+        ctrl.pack(fill="x", padx=8, pady=(0, 4))
+        self.btn_start = NeoButton(ctrl, "▶ 启动挂机", command=self.start_bot,
+                                   bg=GREEN, padx=22)
+        self.btn_start.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        NeoButton(ctrl, "⏹ 停止", command=self.stop_bot, bg=RED, fg="#fff",
+                  padx=18).pack(side="left", padx=(0, 6))
+        NeoButton(ctrl, "⏸", command=self.toggle_pause, bg="#3a3f55", fg=TEXT,
+                  padx=12).pack(side="left")
+        tk.Label(left, text="F8 启动/停止 · F9 暂停/恢复（控制台聚焦时生效）",
+                 bg=PANEL, fg=TEXT_DIM, font=(FONT, 8)).pack(pady=(0, 8))
+
+    def _build_target_tab(self, tab):
+        # 窗口绑定
+        box, body = self._section(tab, "🪟 窗口绑定")
+        box.pack(fill="x", padx=8, pady=(8, 4))
+        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x")
+        self.win_combo = ttk.Combobox(row, state="readonly")
+        self.win_combo.pack(side="left", fill="x", expand=True)
+        NeoButton(row, "⟳", command=self.refresh_windows, bg=PANEL, fg=TEXT,
+                  padx=9).pack(side="left", padx=(6, 0))
+        NeoButton(row, "绑定", command=self.bind_window, padx=10).pack(side="left", padx=(6, 0))
+        self.win_label = tk.Label(body, text="未绑定", fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 9))
+        self.win_label.pack(anchor="w", pady=(4, 0))
+        self.refresh_windows()
+
+        # 模板
+        box, body = self._section(tab, "👾 目标模板（怪物 / 玩家）")
+        box.pack(fill="both", expand=True, padx=8, pady=4)
+        lw = tk.Frame(body, bg=PANEL_2)
+        lw.pack(fill="both", expand=True)
+        self.tpl_listbox = tk.Listbox(lw, bg="#141722", fg=TEXT, height=6,
+                                      selectbackground=ACCENT, selectforeground="#16181f",
+                                      highlightthickness=1, highlightbackground=BORDER,
+                                      relief="flat", font=(FONT, 9), activestyle="none")
+        sb = tk.Scrollbar(lw, command=self.tpl_listbox.yview)
+        self.tpl_listbox.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tpl_listbox.pack(side="left", fill="both", expand=True)
+        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x", pady=(6, 0))
+        NeoButton(row, "📷 框选怪物模板", command=self.add_monster_template).pack(side="left")
+        NeoButton(row, "🗑 删除", command=self.remove_template, bg="#3a3f55",
+                  fg=TEXT).pack(side="left", padx=(6, 0))
+        row2 = tk.Frame(body, bg=PANEL_2); row2.pack(fill="x", pady=(6, 0))
+        NeoButton(row2, "🧍 框选玩家模板", command=self.add_player_template,
+                  bg="#2f6f4f", fg=TEXT).pack(side="left")
+        NeoButton(row2, "清除玩家", command=self.clear_player, bg="#3a3f55",
+                  fg=TEXT).pack(side="left", padx=(6, 0))
+        self.player_label = tk.Label(body, text="玩家模板：未设置", fg=TEXT_DIM,
+                                     bg=PANEL_2, font=(FONT, 9))
+        self.player_label.pack(anchor="w", pady=(2, 0))
+        self.refresh_tpl_list()
+
+        # 状态条 & 检测区域
+        box, body = self._section(tab, "❤ 状态条校准（红HP · 蓝MP · 黄EXP）")
+        box.pack(fill="x", padx=8, pady=(4, 8))
+        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x")
+        NeoButton(row, "🎯 HP条", command=lambda: self.calibrate_bar("hp"),
+                  bg=HP, fg="#fff").pack(side="left")
+        NeoButton(row, "🎯 MP条", command=lambda: self.calibrate_bar("mp"),
+                  bg=MP, fg="#fff").pack(side="left", padx=(6, 0))
+        NeoButton(row, "🎯 EXP条", command=lambda: self.calibrate_bar("exp"),
+                  bg="#ffd23e", fg="#16181f").pack(side="left", padx=(6, 0))
+        row2 = tk.Frame(body, bg=PANEL_2); row2.pack(fill="x", pady=(6, 0))
+        NeoButton(row2, "🧭 检测区域", command=self.calibrate_region,
+                  bg="#3a3f55", fg=TEXT).pack(side="left")
+        NeoButton(row2, "⛶ 全屏", command=self.clear_region,
+                  bg="#3a3f55", fg=TEXT).pack(side="left", padx=(6, 0))
+        tk.Label(body, text="提示：满血/满蓝时完整框选整条状态条（含空槽），颜色自动识别",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(4, 0))
+
+        # 巡逻路线
+        box, body = self._section(tab, "🗺 巡逻路线（沿小地图路点边走边打）")
+        box.pack(fill="x", padx=8, pady=(4, 8))
+        row = tk.Frame(body, bg=PANEL_2);
+        row.pack(fill="x")
+        NeoButton(row, "🧭 校准小地图", command=self.calibrate_minimap).pack(side="left")
+        NeoButton(row, "✏ 编辑路线", command=self.edit_route,
+                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(6, 0))
+        NeoButton(row, "🗑 清空路线", command=self.clear_route,
+                  bg="#3a3f55", fg=TEXT).pack(side="left", padx=(6, 0))
+        row2 = tk.Frame(body, bg=PANEL_2);
+        row2.pack(fill="x", pady=(6, 0))
+        self.patrol_var = tk.BooleanVar(
+            value=self.cfg.get("patrol", {}).get("enabled", False))
+        tk.Checkbutton(row2, text="启用路线巡逻", variable=self.patrol_var,
+                       bg=PANEL_2, fg=TEXT, selectcolor="#141722",
+                       activebackground=PANEL_2, activeforeground=TEXT,
+                       font=(FONT, 9),
+                       command=lambda: self._toggle_patrol(self.patrol_var)).pack(side="left")
+        tk.Label(row2, text="（不启用则左右找怪）", fg=TEXT_DIM, bg=PANEL_2,
+                 font=(FONT, 8)).pack(side="left", padx=(6, 0))
+        self.patrol_label = tk.Label(body, text="", fg=TEXT_DIM, bg=PANEL_2,
+                                     font=(FONT, 9))
+        self.patrol_label.pack(anchor="w", pady=(4, 0))
+        self.refresh_patrol_label()
+
+    def _build_key_tab(self, tab):
+        box, body = self._section(tab, "⌨ 按键映射（点击输入框 → 按键盘按键）")
+        box.pack(fill="x", padx=8, pady=8)
+        for i, (label, key) in enumerate(self.KEY_ROWS):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(body, bg=PANEL_2)
+            cell.grid(row=r, column=c, sticky="w", padx=(0, 14), pady=5)
+            tk.Label(cell, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                     width=6, anchor="w").pack(side="left")
+            KeyEntry(cell, value=self.cfg["keys"].get(key, ""),
+                     on_change=lambda v, k=key: self._set_key(k, v)).pack(side="left")
+        tk.Label(body, text="支持：字母 / 数字 / F1-F12 / 方向键 / ALT / SHIFT / INSERT / HOME 等",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _build_param_tab(self, tab):
+        box, body = self._section(tab, "🎚 识别与策略参数")
+        box.pack(fill="x", padx=8, pady=8)
+
+        def slider(label, frm, to, key, fmt="{:.0f}"):
+            row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x", pady=4)
+            tk.Label(row, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                     width=9, anchor="w").pack(side="left")
+            vl = tk.Label(row, text=fmt.format(self.cfg["thresholds"][key]),
+                          bg=PANEL_2, fg=ACCENT, font=(MONO, 9, "bold"), width=6)
+            vl.pack(side="right")
+            sc = ttk.Scale(row, from_=frm, to=to, value=self.cfg["thresholds"][key],
+                           command=lambda v: (self.cfg["thresholds"].__setitem__(
+                               key, float(v)), vl.config(text=fmt.format(float(v)))))
+            sc.pack(side="left", fill="x", expand=True, padx=(4, 8))
+            sc.bind("<ButtonRelease-1>", lambda e: self.cfg_mgr.save())
+
+        slider("匹配阈值", 0.50, 0.98, "match", "{:.2f}")
+        slider("红药阈值%", 10, 90, "hp_potion")
+        slider("蓝药阈值%", 10, 90, "mp_potion")
+        slider("攻击距离px", 40, 400, "attack_range")
+        slider("喝药冷却s", 0.5, 5, "potion_cooldown", "{:.1f}")
+        slider("巡逻换向s", 1, 8, "roam_interval", "{:.1f}")
+
+        box2, body2 = self._section(tab, "🛡 行为开关")
+        box2.pack(fill="x", padx=8, pady=(0, 8))
+        for key, label in [("use_skill_rotation", "技能轮换输出（攻击/技能循环）"),
+                           ("jump_while_roam", "巡逻时随机跳跃"),
+                           ("stop_on_low_hp", "血量过低自动停机保护"),
+                           ("pause_on_unfocus", "游戏失焦时暂停按键（推荐开启）")]:
+            var = tk.BooleanVar(value=self.cfg["options"].get(key, False))
+            tk.Checkbutton(body2, text=label, variable=var, bg=PANEL_2, fg=TEXT,
+                           selectcolor="#141722", activebackground=PANEL_2,
+                           activeforeground=TEXT, font=(FONT, 9), anchor="w",
+                           command=lambda k=key, v=var: (self.cfg["options"].__setitem__(
+                               k, v.get()), self.cfg_mgr.save())).pack(fill="x", pady=1)
+
+    # ---------- 右侧：预览 + 状态 + 日志 ----------
+    def _build_right(self, right):
+        card = tk.Frame(right, bg=PANEL, padx=12, pady=10,
+                        highlightthickness=1, highlightbackground=BORDER)
+        card.pack(fill="x")
+        head = tk.Frame(card, bg=PANEL); head.pack(fill="x")
+        tk.Label(head, text="📡 实时识别画面", bg=PANEL, fg=TEXT,
+                 font=(FONT, 11, "bold")).pack(side="left")
+        self.info_label = tk.Label(head, text="", bg=PANEL, fg=TEXT_DIM, font=(MONO, 9))
+        self.info_label.pack(side="right")
+
+        self.preview_canvas = tk.Canvas(card, width=self.PREVIEW_W, height=self.PREVIEW_H,
+                                        bg="#0a0c12", highlightthickness=1,
+                                        highlightbackground=BORDER)
+        self.preview_canvas.pack(fill="x", pady=(8, 0))
+        self._draw_placeholder()
+
+        res = tk.Frame(card, bg=PANEL); res.pack(fill="x", pady=(10, 0))
+        bw = int((self.PREVIEW_W - 20) / 3)
+        self.hp_bar_w = Bar(res, "HP", HP, width=bw)
+        self.hp_bar_w.pack(side="left")
+        self.mp_bar_w = Bar(res, "MP", MP, width=bw)
+        self.mp_bar_w.pack(side="left", padx=(10, 0))
+        self.exp_bar_w = Bar(res, "EXP", "#ffd23e", width=bw)
+        self.exp_bar_w.pack(side="left", padx=(10, 0))
+
+        chips = tk.Frame(card, bg=PANEL); chips.pack(fill="x", pady=(10, 0))
+        self.chip_fps = self._chip(chips, "FPS", "0")
+        self.chip_mon = self._chip(chips, "目标", "0")
+        self.chip_act = self._chip(chips, "动作", "-")
+        self.chip_mode = self._chip(chips, "模式", "待机")
+
+        logcard = tk.Frame(right, bg=PANEL, padx=12, pady=10,
+                           highlightthickness=1, highlightbackground=BORDER)
+        logcard.pack(fill="both", expand=True, pady=(12, 0))
+        tk.Label(logcard, text="📜 运行日志", bg=PANEL, fg=TEXT,
+                 font=(FONT, 11, "bold")).pack(anchor="w")
+        self.log_text = tk.Text(logcard, bg="#0d0f16", fg="#b9bfd4", relief="flat",
+                                font=(MONO, 9), state="disabled")
+        ysb = tk.Scrollbar(logcard, command=self.log_text.yview)
+        self.log_text.config(yscrollcommand=ysb.set)
+        ysb.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True, pady=(8, 0))
+        for tag, color in (("info", "#9fb3c8"), ("warn", "#ffc247"),
+                           ("error", "#ff6b6b"), ("ok", "#3ddc84")):
+            self.log_text.tag_config(tag, foreground=color)
+
+    def _chip(self, parent, name, value):
+        f = tk.Frame(parent, bg=PANEL_2, padx=10, pady=5)
+        f.pack(side="left", padx=(0, 10))
+        tk.Label(f, text=name, bg=PANEL_2, fg=TEXT_DIM, font=(FONT, 8)).pack(side="left")
+        lbl = tk.Label(f, text=value, bg=PANEL_2, fg=ACCENT, font=(MONO, 10, "bold"))
+        lbl.pack(side="left", padx=(6, 0))
+        return lbl
+
+    def _draw_placeholder(self):
+        c = self.preview_canvas
+        c.delete("all")
+        c.create_text(self.PREVIEW_W / 2, self.PREVIEW_H / 2, text="未绑定窗口",
+                      fill="#3a4159", font=(FONT, 13))
+        c.create_text(self.PREVIEW_W / 2, self.PREVIEW_H / 2 + 26,
+                      text="绑定窗口后自动显示实时识别标注画面",
+                      fill="#2a3049", font=(FONT, 9))
+
+    # ================= 业务动作 =================
+    def refresh_windows(self):
+        self.win_combo["values"] = [t for t, _ in WindowCapture.list_windows()]
+        saved = self.cfg.get("window_title", "")
+        for i, t in enumerate(self.win_combo["values"]):
+            if saved and saved.lower() in t.lower():
+                self.win_combo.current(i)
+                break
+
+    def bind_window(self):
+        title = self.win_combo.get()
+        if not title:
+            messagebox.showwarning("提示", "请先选择游戏窗口", parent=self)
+            return
+        if self.engine.bind_window(title):
+            self.cfg["window_title"] = title
+            self.cfg_mgr.save()
+            self.engine.set_mode(Mode.PREVIEW)
+            self.win_label.config(text=f"✅ {self.engine.capture.window_title}", fg=GREEN)
+            self.log(f"窗口绑定成功：{self.engine.capture.window_title}", "ok")
+        else:
+            self.win_label.config(text="❌ 绑定失败", fg=RED)
+            self.log("窗口绑定失败", "error")
+
+    def _grab_frame(self):
+        if not self.engine.window_bound():
+            messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self)
+            return None
+            # ⚠ numpy 数组禁止用 or / and / if 判断真值，必须显式 is None
+        frame = self.engine.capture.screenshot()  # 优先实时截图（框选需要当前画面）
+        if frame is None:
+            frame = self.engine.latest_frame()  # 回退：引擎缓存帧
+        if frame is None:
+            messagebox.showerror("错误", "截图失败：请确认游戏窗口未最小化", parent=self)
+        return frame
+
+    def add_monster_template(self):
+        frame = self._grab_frame()
+        if frame is None:
+            return
+
+        def ok(rect):
+            x, y, w, h = rect
+            name = simpledialog.askstring(
+                "模板命名", "为该怪物模板命名：", parent=self,
+                initialvalue=f"怪物{len(self.cfg['monster_templates']) + 1}")
+            if not name:
+                return
+            path = os.path.join(TEMPLATE_DIR, f"{int(time.time() * 1000)}.png")
+            cv2.imwrite(path, frame[y:y + h, x:x + w])
+            self.cfg["monster_templates"].append({"name": name, "path": path})
+            self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+            self.log(f"新增怪物模板「{name}」({w}×{h})", "ok")
+
+        RegionSelector(self, frame, mode="template", on_ok=ok,
+                       tip="框选怪物本体（建议刚好包住，背景越干净识别越准）")
+
+    def add_player_template(self):
+        frame = self._grab_frame()
+        if frame is None:
+            return
+
+        def ok(rect):
+            x, y, w, h = rect
+            path = os.path.join(TEMPLATE_DIR, f"player_{int(time.time() * 1000)}.png")
+            cv2.imwrite(path, frame[y:y + h, x:x + w])
+            self.cfg["player_template"] = {"name": "玩家", "path": path}
+            self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+            self.log(f"玩家模板已设置 ({w}×{h})", "ok")
+
+        RegionSelector(self, frame, mode="template", on_ok=ok, tip="框选你的角色本体")
+
+    def remove_template(self):
+        sel = self.tpl_listbox.curselection()
+        if not sel:
+            return
+        removed = self.cfg["monster_templates"].pop(sel[0])
+        self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+        self.log(f"已删除模板「{removed['name']}」", "warn")
+
+    def clear_player(self):
+        self.cfg["player_template"] = None
+        self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+        self.log("已清除玩家模板（将原地输出攻击）", "info")
+
+    def refresh_tpl_list(self):
+        self.tpl_listbox.delete(0, "end")
+        for item in self.cfg["monster_templates"]:
+            self.tpl_listbox.insert("end", f"👾 {item['name']}")
+        pt = self.cfg.get("player_template")
+        self.player_label.config(
+            text=f"玩家模板：{pt['name']}" if pt else "玩家模板：未设置（将原地输出攻击）",
+            fg=TEXT if pt else TEXT_DIM)
+
+    def calibrate_bar(self, which):
+        frame = self._grab_frame()
+        if frame is None:
+            return
+        def ok(res):
+            self.cfg[f"{which}_bar"].update(res)  # 仅 x/y/w/h
+            self.cfg_mgr.save()
+            self.engine.reload_runtime()
+            h = self.engine.calibrate_bar_color(which, frame)
+            self.log(f"{which.upper()}条校准完成 区域=({res['x']},{res['y']}) "
+                     f"{res['w']}×{res['h']}"
+                     + (f" · 实测色相H={h}，区间已自适配" if h is not None
+                        else " · 未检出彩色像素，使用内置预设"), "ok")
+
+        RegionSelector(self, frame, mode="bar", on_ok=ok,
+                       tip="请在满血/满蓝状态下完整框选整条（红=HP 蓝=MP 黄=EXP，含空槽部分）")
+
+    def calibrate_region(self):
+        frame = self._grab_frame()
+        if frame is None:
+            return
+
+        def ok(rect):
+            self.cfg["detect_region"] = list(rect)
+            self.cfg_mgr.save()
+            self.log(f"检测区域已设置: {rect}", "ok")
+
+        RegionSelector(self, frame, mode="region", on_ok=ok,
+                       tip="框选怪物经常出没的区域，可显著提升识别速度")
+
+    # ---------- 巡逻路线 ----------
+    def _patrol_cfg(self):
+        return self.cfg.setdefault("patrol", {})
+
+    def calibrate_minimap(self):
+        frame = self._grab_frame()
+        if frame is None:
+            return
+
+        def ok(rect):
+            x, y, w, h = rect
+            p = self._patrol_cfg()
+            p["minimap"] = {"x": x, "y": y, "w": w, "h": h}
+            self.cfg_mgr.save()
+            self.engine.reload_runtime()  # 先让导航拿到新区域
+            self.log("正在采样小地图玩家点颜色…", "info")
+            frames = self.engine.grab_frames(6, 0.12)  # 多帧对抗黄点闪烁
+            color = self.engine.sample_dot_color(frames)
+            if color:
+                p["player_dot_color"] = color
+                self.cfg_mgr.save()
+                self.engine.reload_runtime()
+            self.refresh_patrol_label()
+            self.log(f"小地图校准完成 ({w}×{h})"
+                     + (f" · 玩家点颜色已采样 {color}" if color
+                        else " · 未检出黄点，使用默认黄色，可稍后重新校准"), "ok")
+
+        RegionSelector(self, frame, mode="region", on_ok=ok,
+                       tip="框选小地图的【地图区域】（不含标题文字，尽量贴紧边界）")
+
+    def edit_route(self):
+        p = self._patrol_cfg()
+        mm = p.get("minimap", {})
+        if mm.get("w", 0) < 5:
+            messagebox.showwarning("提示", "请先「校准小地图」，再编辑路线", parent=self)
+            return
+        frame = self._grab_frame()
+        if frame is None:
+            return
+        crop = frame[mm["y"]:mm["y"] + mm["h"],
+               mm["x"]:mm["x"] + mm["w"]].copy()
+        dot = self.engine.nav.player_pos(frame)  # 黄点闪烁 → 多试几帧
+        if dot is None:
+            for _ in range(4):
+                time.sleep(0.12)
+                f2 = self.engine.capture.screenshot()
+                if f2 is not None and self.engine.nav.player_pos(f2) is not None:
+                    dot = self.engine.nav.player_pos(f2)
+                    break
+
+        def ok(res):
+            p["waypoints"] = res["waypoints"]
+            p["mode"] = res["mode"]
+            if len(res["waypoints"]) >= 2:
+                p["enabled"] = True  # 布好路线自动启用
+            self.cfg_mgr.save()
+            self.engine.reload_runtime()
+            self.refresh_patrol_label()
+            self.log(f"路线已保存：{len(res['waypoints'])} 个路点 · "
+                     f"{'往返' if res['mode'] == 'pingpong' else '循环'}模式 · 已自动启用", "ok")
+
+        RouteEditor(self, crop, waypoints=p.get("waypoints"),
+                    mode=p.get("mode", "pingpong"), player_dot=dot, on_ok=ok)
+
+    def clear_route(self):
+        self._patrol_cfg()["waypoints"] = []
+        self.cfg_mgr.save()
+        self.engine.reload_runtime()
+        self.refresh_patrol_label()
+        self.log("巡逻路线已清空", "warn")
+
+    def refresh_patrol_label(self):
+        p = self.cfg.get("patrol", {})
+        mm = p.get("minimap", {})
+        wp = p.get("waypoints", [])
+        parts = ["小地图 ✓" if mm.get("w", 0) > 4 else "小地图 ✗", f"路点 {len(wp)}"]
+        if wp:
+            parts.append("往返" if p.get("mode") == "pingpong" else "循环")
+        parts.append("已启用" if p.get("enabled") else "未启用")
+        ok = mm.get("w", 0) > 4 and len(wp) >= 2 and p.get("enabled")
+        self.patrol_label.config(text=" · ".join(parts), fg=TEXT if ok else TEXT_DIM)
+
+    def _toggle_patrol(self, var):
+        self._patrol_cfg()["enabled"] = var.get()
+        self.cfg_mgr.save()
+        self.engine.reload_runtime()
+        self.refresh_patrol_label()
+        self.log(f"路线巡逻 {'启用' if var.get() else '停用'}", "info")
+
+    def clear_region(self):
+        self.cfg["detect_region"] = None
+        self.cfg_mgr.save()
+        self.log("检测区域已恢复全屏", "info")
+
+    def _set_key(self, key, value):
+        if value and value != "-":
+            self.cfg["keys"][key] = value
+            self.cfg_mgr.save()
+            self.log(f"按键 [{key}] → {value}", "info")
+
+    def start_bot(self, _e=None):
+        if not self.engine.window_bound():
+            messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self); return
+        if not self.cfg["monster_templates"]:
+            messagebox.showwarning("提示", "请至少框选一个怪物模板", parent=self); return
+        p = self.cfg.get("patrol", {})
+        if p.get("enabled") and not self.engine.nav.ready:
+            self.log("⚠ 已勾选路线巡逻但小地图/路点未配置齐全，将退回左右找怪", "warn")
+        if not self.cfg["hp_bar"].get("w"):
+            self.log("⚠ 尚未校准HP条，血量监控将不可用", "warn")
+        self.cfg_mgr.save(); self.engine.reload_runtime()
+        self.engine.set_mode(Mode.RUNNING)
+        self.log("🚀 挂机启动！按键将发送到游戏窗口，请勿最小化游戏", "ok")
+
+    def stop_bot(self, _e=None):
+        self.engine.set_mode(Mode.PREVIEW)
+        self.log("⏹ 已停止战斗，保持监控", "warn")
+
+    def toggle_run(self, _e=None):
+        self.stop_bot() if self.engine.mode == Mode.RUNNING else self.start_bot()
+
+    def toggle_pause(self, _e=None):
+        if self.engine.mode == Mode.RUNNING:
+            self.engine.set_mode(Mode.PAUSED); self.log("已暂停", "warn")
+        elif self.engine.mode == Mode.PAUSED:
+            self.engine.set_mode(Mode.RUNNING); self.log("恢复运行", "ok")
+
+    def log(self, msg, lv="info"):
+        self.log_queue.put((time.strftime("%H:%M:%S"), msg, lv))
+
+    # ================= 轮询刷新 =================
+    def _poll_status(self):
+        ann = None
+        try:
+            ann = self.engine.preview_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if ann is not None:
+            self._show_preview(ann)
+
+        st = self.engine.status
+        self.hp_bar_w.set(st["hp"]); self.mp_bar_w.set(st["mp"])
+        self.exp_bar_w.set(st["exp"])
+        self.chip_fps.config(text=str(st["fps"]))
+        self.chip_mon.config(text=str(st["monsters"]))
+        self.chip_act.config(text=str(st["action"]))
+        self.chip_mode.config(text={"idle": "待机", "preview": "监控",
+                                    "running": "运行", "paused": "暂停"}[st["mode"]])
+        conf = {"idle": ("待机", "#6b7280"), "preview": ("监控中", ACCENT),
+                "running": ("运行中", GREEN), "paused": ("已暂停", "#ffb020")}[st["mode"]]
+        if self._pill_state != conf:
+            self._pill_state = conf
+            self.pill_dot.delete("all")
+            self.pill_dot.create_oval(1, 1, 9, 9, fill=conf[1], outline="")
+            self.pill_lbl.config(text=conf[0], fg=conf[1])
+        if self.engine.window_bound():
+            w, h = self.engine.capture.size
+            self.info_label.config(text=f"{w}×{h}px · 模板 {len(self.engine.detector.templates)} 个")
+        self.after(80, self._poll_status)
+
+    def _show_preview(self, ann):
+        img = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+        s = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
+        nw, nh = max(1, int(w * s)), max(1, int(h * s))
+        img = cv2.resize(img, (nw, nh))
+        self._pv_photo = ImageTk.PhotoImage(Image.fromarray(img))
+        c = self.preview_canvas
+        c.delete("all")
+        c.create_rectangle(0, 0, self.PREVIEW_W, self.PREVIEW_H, fill="#0a0c12", outline="")
+        c.create_image((self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2,
+                       anchor="nw", image=self._pv_photo)
+
+    def _poll_log(self):
+        changed = False
+        while True:
+            try:
+                ts, msg, lv = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.log_text.config(state="normal")
+            self.log_text.insert("end", f"[{ts}] ", lv)
+            self.log_text.insert("end", f"{msg}\n", lv)
+            self.log_text.see("end")
+            changed = True
+        if changed:
+            self.log_text.config(state="disabled")
+        self.after(250, self._poll_log)
+
+    def _on_close(self):
+        self.engine.shutdown()
+        self.cfg_mgr.save()
+        self.destroy()

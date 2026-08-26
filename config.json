@@ -1,0 +1,118 @@
+{
+  "window_title": "冒险岛怀旧服",
+  "monster_templates": [
+    {
+      "name": "花蘑菇1",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787747706659.png"
+    },
+    {
+      "name": "蘑菇仔",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787747806112.png"
+    },
+    {
+      "name": "红蜗牛",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787747911442.png"
+    },
+    {
+      "name": "花蘑菇2",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787749017338.png"
+    }
+  ],
+  "player_template": {
+    "name": "玩家",
+    "path": "D:\\test_demo\\MxdAutoLvup\\templates\\player_1787747763470.png"
+  },
+  "detect_region": null,
+  "hp_bar": {
+    "x": 471,
+    "y": 700,
+    "w": 97,
+    "h": 13,
+    "color": [
+      40,
+      40,
+      210
+    ],
+    "tolerance": 60
+  },
+  "mp_bar": {
+    "x": 571,
+    "y": 701,
+    "w": 102,
+    "h": 16,
+    "color": [
+      210,
+      110,
+      40
+    ],
+    "tolerance": 60
+  },
+  "exp_bar": {
+    "x": 0,
+    "y": 0,
+    "w": 0,
+    "h": 0
+  },
+  "keys": {
+    "attack": "q",
+    "skill1": "q",
+    "skill2": "q",
+    "skill3": "q",
+    "hp_potion": "1",
+    "mp_potion": "2",
+    "move_left": "left",
+    "move_right": "right",
+    "jump": "alt"
+  },
+  "thresholds": {
+    "match": 0.8,
+    "hp_potion": 55,
+    "mp_potion": 35,
+    "hp_stop": 12,
+    "attack_range": 160,
+    "potion_cooldown": 1.2,
+    "roam_interval": 2.5
+  },
+  "options": {
+    "use_skill_rotation": true,
+    "jump_while_roam": true,
+    "stop_on_low_hp": true,
+    "pause_on_unfocus": true
+  },
+  "patrol": {
+    "enabled": false,
+    "minimap": {
+      "x": 3,
+      "y": 1,
+      "w": 157,
+      "h": 150
+    },
+    "player_dot_color": [
+      17,
+      153,
+      221
+    ],
+    "dot_tolerance": 80,
+    "waypoints": [
+      [
+        126,
+        109
+      ],
+      [
+        24,
+        110
+      ],
+      [
+        26,
+        80
+      ],
+      [
+        108,
+        77
+      ]
+    ],
+    "mode": "loop",
+    "arrive_tol": 6,
+    "max_chase_time": 8.0
+  }
+}
