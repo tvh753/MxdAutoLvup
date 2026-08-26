@@ -6,14 +6,15 @@
 
 import cv2
 import numpy as np
+from core.imio import imread_u
 
 
 class Template:
     def __init__(self, name, path):
         self.name, self.path = name, path
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        img = imread_u(path, cv2.IMREAD_COLOR)  # 原 cv2.imread
         if img is None:
-            raise FileNotFoundError(f"模板读取失败: {path}")
+            raise FileNotFoundError(f"模板读取失败(文件不存在或解码异常): {path}")
         self.gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # 灰度匹配抗光照
         self.h, self.w = self.gray.shape[:2]
 

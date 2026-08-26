@@ -12,16 +12,16 @@ import cv2
 from PIL import Image, ImageTk
 
 from gui.theme import *
-from gui.widgets import NeoButton, Bar, KeyEntry
+from gui.widgets import NeoButton, Bar, KeyEntry, ScrollFrame
 from gui.region_selector import RegionSelector
-from gui.route_editor import RouteEditor
+# from gui.route_editor import RouteEditor
 # from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
 from core.bot_engine import BotEngine, Mode
 from core.window_capture import WindowCapture
 from gui.route_painter import RoutePainter
 from core.map_manager import MapManager
 from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
-
+from core.imio import imwrite_u
 
 class App(tk.Tk):
     PREVIEW_W, PREVIEW_H = 760, 430
@@ -129,12 +129,15 @@ class App(tk.Tk):
     def _build_left(self, left):
         nb = ttk.Notebook(left)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
-        t1 = tk.Frame(nb, bg=PANEL); nb.add(t1, text=" 🎯 目标 ")
-        t2 = tk.Frame(nb, bg=PANEL); nb.add(t2, text=" ⌨ 按键 ")
-        t3 = tk.Frame(nb, bg=PANEL); nb.add(t3, text=" ⚙ 参数 ")
-        self._build_target_tab(t1)
-        self._build_key_tab(t2)
-        self._build_param_tab(t3)
+        t1 = ScrollFrame(nb, bg=PANEL);
+        nb.add(t1, text=" 🎯 目标 ")
+        t2 = ScrollFrame(nb, bg=PANEL);
+        nb.add(t2, text=" ⌨ 按键 ")
+        t3 = ScrollFrame(nb, bg=PANEL);
+        nb.add(t3, text=" ⚙ 参数 ")
+        self._build_target_tab(t1.content)  # ← 传入 .content
+        self._build_key_tab(t2.content)
+        self._build_param_tab(t3.content)
 
         ctrl = tk.Frame(left, bg=PANEL)
         ctrl.pack(fill="x", padx=8, pady=(0, 4))
@@ -152,7 +155,8 @@ class App(tk.Tk):
         # 窗口绑定
         box, body = self._section(tab, "🪟 窗口绑定")
         box.pack(fill="x", padx=8, pady=(8, 4))
-        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x")
+        row = tk.Frame(body, bg=PANEL_2);
+        row.pack(fill="x")
         self.win_combo = ttk.Combobox(row, state="readonly")
         self.win_combo.pack(side="left", fill="x", expand=True)
         NeoButton(row, "⟳", command=self.refresh_windows, bg=PANEL, fg=TEXT,
@@ -175,11 +179,13 @@ class App(tk.Tk):
         self.tpl_listbox.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.tpl_listbox.pack(side="left", fill="both", expand=True)
-        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x", pady=(6, 0))
+        row = tk.Frame(body, bg=PANEL_2);
+        row.pack(fill="x", pady=(6, 0))
         NeoButton(row, "📷 框选怪物模板", command=self.add_monster_template).pack(side="left")
         NeoButton(row, "🗑 删除", command=self.remove_template, bg="#3a3f55",
                   fg=TEXT).pack(side="left", padx=(6, 0))
-        row2 = tk.Frame(body, bg=PANEL_2); row2.pack(fill="x", pady=(6, 0))
+        row2 = tk.Frame(body, bg=PANEL_2);
+        row2.pack(fill="x", pady=(6, 0))
         NeoButton(row2, "🧍 框选玩家模板", command=self.add_player_template,
                   bg="#2f6f4f", fg=TEXT).pack(side="left")
         NeoButton(row2, "清除玩家", command=self.clear_player, bg="#3a3f55",
@@ -192,14 +198,16 @@ class App(tk.Tk):
         # 状态条 & 检测区域
         box, body = self._section(tab, "❤ 状态条校准（红HP · 蓝MP · 黄EXP）")
         box.pack(fill="x", padx=8, pady=(4, 8))
-        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x")
+        row = tk.Frame(body, bg=PANEL_2);
+        row.pack(fill="x")
         NeoButton(row, "🎯 HP条", command=lambda: self.calibrate_bar("hp"),
                   bg=HP, fg="#fff").pack(side="left")
         NeoButton(row, "🎯 MP条", command=lambda: self.calibrate_bar("mp"),
                   bg=MP, fg="#fff").pack(side="left", padx=(6, 0))
         NeoButton(row, "🎯 EXP条", command=lambda: self.calibrate_bar("exp"),
                   bg="#ffd23e", fg="#16181f").pack(side="left", padx=(6, 0))
-        row2 = tk.Frame(body, bg=PANEL_2); row2.pack(fill="x", pady=(6, 0))
+        row2 = tk.Frame(body, bg=PANEL_2);
+        row2.pack(fill="x", pady=(6, 0))
         NeoButton(row2, "🧭 检测区域", command=self.calibrate_region,
                   bg="#3a3f55", fg=TEXT).pack(side="left")
         NeoButton(row2, "⛶ 全屏", command=self.clear_region,
@@ -267,7 +275,8 @@ class App(tk.Tk):
         box.pack(fill="x", padx=8, pady=8)
 
         def slider(label, frm, to, key, fmt="{:.0f}"):
-            row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x", pady=4)
+            row = tk.Frame(body, bg=PANEL_2);
+            row.pack(fill="x", pady=4)
             tk.Label(row, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
                      width=9, anchor="w").pack(side="left")
             vl = tk.Label(row, text=fmt.format(self.cfg["thresholds"][key]),
@@ -301,6 +310,7 @@ class App(tk.Tk):
 
         box3, body3 = self._section(tab, "🗺 巡逻微调")
         box3.pack(fill="x", padx=8, pady=(0, 8))
+
         def pslider(label, frm, to, key, default, fmt="{:.0f}"):
             p = self.cfg.setdefault("patrol", {})
             row = tk.Frame(body3, bg=PANEL_2);
@@ -320,13 +330,13 @@ class App(tk.Tk):
         pslider("搜索半径", 4, 25, "search_range", 10)
         pslider("抓绳容差", 2, 10, "grab_tol", 4)
 
-
     # ---------- 右侧：预览 + 状态 + 日志 ----------
     def _build_right(self, right):
         card = tk.Frame(right, bg=PANEL, padx=12, pady=10,
                         highlightthickness=1, highlightbackground=BORDER)
         card.pack(fill="x")
-        head = tk.Frame(card, bg=PANEL); head.pack(fill="x")
+        head = tk.Frame(card, bg=PANEL);
+        head.pack(fill="x")
         tk.Label(head, text="📡 实时识别画面", bg=PANEL, fg=TEXT,
                  font=(FONT, 11, "bold")).pack(side="left")
         self.info_label = tk.Label(head, text="", bg=PANEL, fg=TEXT_DIM, font=(MONO, 9))
@@ -338,7 +348,8 @@ class App(tk.Tk):
         self.preview_canvas.pack(fill="x", pady=(8, 0))
         self._draw_placeholder()
 
-        res = tk.Frame(card, bg=PANEL); res.pack(fill="x", pady=(10, 0))
+        res = tk.Frame(card, bg=PANEL);
+        res.pack(fill="x", pady=(10, 0))
         bw = int((self.PREVIEW_W - 20) / 3)
         self.hp_bar_w = Bar(res, "HP", HP, width=bw)
         self.hp_bar_w.pack(side="left")
@@ -347,7 +358,8 @@ class App(tk.Tk):
         self.exp_bar_w = Bar(res, "EXP", "#ffd23e", width=bw)
         self.exp_bar_w.pack(side="left", padx=(10, 0))
 
-        chips = tk.Frame(card, bg=PANEL); chips.pack(fill="x", pady=(10, 0))
+        chips = tk.Frame(card, bg=PANEL);
+        chips.pack(fill="x", pady=(10, 0))
         self.chip_fps = self._chip(chips, "FPS", "0")
         self.chip_mon = self._chip(chips, "目标", "0")
         self.chip_act = self._chip(chips, "动作", "-")
@@ -434,9 +446,13 @@ class App(tk.Tk):
             if not name:
                 return
             path = os.path.join(TEMPLATE_DIR, f"{int(time.time() * 1000)}.png")
-            cv2.imwrite(path, frame[y:y + h, x:x + w])
+            if not imwrite_u(path, frame[y:y + h, x:x + w]):
+                self.log(f"模板写入磁盘失败: {path}", "error")
+                return
             self.cfg["monster_templates"].append({"name": name, "path": path})
-            self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+            self.cfg_mgr.save();
+            self.engine.reload_runtime();
+            self.refresh_tpl_list()
             self.log(f"新增怪物模板「{name}」({w}×{h})", "ok")
 
         RegionSelector(self, frame, mode="template", on_ok=ok,
@@ -450,9 +466,13 @@ class App(tk.Tk):
         def ok(rect):
             x, y, w, h = rect
             path = os.path.join(TEMPLATE_DIR, f"player_{int(time.time() * 1000)}.png")
-            cv2.imwrite(path, frame[y:y + h, x:x + w])
+            if not imwrite_u(path, frame[y:y + h, x:x + w]):
+                self.log(f"模板写入磁盘失败: {path}", "error")
+                return
             self.cfg["player_template"] = {"name": "玩家", "path": path}
-            self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+            self.cfg_mgr.save();
+            self.engine.reload_runtime();
+            self.refresh_tpl_list()
             self.log(f"玩家模板已设置 ({w}×{h})", "ok")
 
         RegionSelector(self, frame, mode="template", on_ok=ok, tip="框选你的角色本体")
@@ -462,12 +482,16 @@ class App(tk.Tk):
         if not sel:
             return
         removed = self.cfg["monster_templates"].pop(sel[0])
-        self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+        self.cfg_mgr.save();
+        self.engine.reload_runtime();
+        self.refresh_tpl_list()
         self.log(f"已删除模板「{removed['name']}」", "warn")
 
     def clear_player(self):
         self.cfg["player_template"] = None
-        self.cfg_mgr.save(); self.engine.reload_runtime(); self.refresh_tpl_list()
+        self.cfg_mgr.save();
+        self.engine.reload_runtime();
+        self.refresh_tpl_list()
         self.log("已清除玩家模板（将原地输出攻击）", "info")
 
     def refresh_tpl_list(self):
@@ -483,6 +507,7 @@ class App(tk.Tk):
         frame = self._grab_frame()
         if frame is None:
             return
+
         def ok(res):
             self.cfg[f"{which}_bar"].update(res)  # 仅 x/y/w/h
             self.cfg_mgr.save()
@@ -601,7 +626,12 @@ class App(tk.Tk):
         if name in self.maps.list_maps() and not messagebox.askyesno(
                 "覆盖确认", f"地图包「{name}」已存在，覆盖保存？", parent=self):
             return
-        self.maps.save(name, self.cfg, self._minimap_snap, self._route_img)
+        try:
+            self.maps.save(name, self.cfg, self._minimap_snap, self._route_img)
+        except Exception as e:
+            self.log(f"地图包保存失败: {e}", "error")
+            messagebox.showerror("错误", f"地图包保存失败：{e}", parent=self)
+            return
         p = self.cfg.setdefault("patrol", {})
         p["current_map"] = name
         p["route_path"] = os.path.join(self.maps.maps_dir, name, "route.png")
@@ -615,6 +645,13 @@ class App(tk.Tk):
 
     def load_map_pack(self):
         name = self.maps_combo.get()
+        self.engine.invalidate_route_cache()
+        ok, missing = self.maps.load(name, self.cfg)
+        if not ok:
+            messagebox.showerror("错误", "地图包加载失败（profile.json 缺失）", parent=self)
+            return
+        if missing:
+            self.log(f"⚠ 地图包「{name}」缺失文件：{', '.join(missing)}，请重新录制对应内容", "warn")
         if not name:
             messagebox.showwarning("提示", "请先选择地图包", parent=self)
             return
@@ -691,14 +728,17 @@ class App(tk.Tk):
 
     def start_bot(self, _e=None):
         if not self.engine.window_bound():
-            messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self); return
+            messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self);
+            return
         if not self.cfg["monster_templates"]:
-            messagebox.showwarning("提示", "请至少框选一个怪物模板", parent=self); return
+            messagebox.showwarning("提示", "请至少框选一个怪物模板", parent=self);
+            return
         if self.cfg.get("patrol", {}).get("enabled") and not self.engine.route_nav.ready:
             self.log("⚠ 已勾选巡逻但颜色路线未就绪（校准小地图→绘制路线），将退回左右找怪", "warn")
         if not self.cfg["hp_bar"].get("w"):
             self.log("⚠ 尚未校准HP条，血量监控将不可用", "warn")
-        self.cfg_mgr.save(); self.engine.reload_runtime()
+        self.cfg_mgr.save();
+        self.engine.reload_runtime()
         self.engine.set_mode(Mode.RUNNING)
         self.log("🚀 挂机启动！按键将发送到游戏窗口，请勿最小化游戏", "ok")
 
@@ -711,9 +751,11 @@ class App(tk.Tk):
 
     def toggle_pause(self, _e=None):
         if self.engine.mode == Mode.RUNNING:
-            self.engine.set_mode(Mode.PAUSED); self.log("已暂停", "warn")
+            self.engine.set_mode(Mode.PAUSED);
+            self.log("已暂停", "warn")
         elif self.engine.mode == Mode.PAUSED:
-            self.engine.set_mode(Mode.RUNNING); self.log("恢复运行", "ok")
+            self.engine.set_mode(Mode.RUNNING);
+            self.log("恢复运行", "ok")
 
     def log(self, msg, lv="info"):
         self.log_queue.put((time.strftime("%H:%M:%S"), msg, lv))
@@ -729,7 +771,8 @@ class App(tk.Tk):
             self._show_preview(ann)
 
         st = self.engine.status
-        self.hp_bar_w.set(st["hp"]); self.mp_bar_w.set(st["mp"])
+        self.hp_bar_w.set(st["hp"]);
+        self.mp_bar_w.set(st["mp"])
         self.exp_bar_w.set(st["exp"])
         self.chip_fps.config(text=str(st["fps"]))
         self.chip_mon.config(text=str(st["monsters"]))

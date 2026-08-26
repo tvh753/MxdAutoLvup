@@ -170,3 +170,90 @@ class KeyEntry(tk.Entry):
         if self._on_change:
             self._on_change(name)
         return "break"
+
+
+# ================= 竖向滚动容器 =================
+_SCROLL_INSTANCES = []
+_WHEEL_BOUND = {"done": False}
+
+
+def _wheel_dispatch(event):
+    """全局滚轮分发：从事件控件向上寻祖，命中 ScrollFrame 则滚动该面板"""
+    if isinstance(event.widget, tk.Text):  # 日志区自己管理滚动
+        return None
+    w = event.widget
+    while w is not None:
+        for sf in _SCROLL_INSTANCES:
+            if w is sf:
+                return sf._scroll(event)
+        w = getattr(w, "master", None)
+    return None
+
+
+class ScrollFrame(tk.Frame):
+    """竖向滚动容器：子控件请 pack/grid 到 .content
+    用法：
+        sf = ScrollFrame(notebook, bg=PANEL)
+        notebook.add(sf, text=" 🎯 目标 ")
+        tk.Label(sf.content, ...).pack()
+    滚轮自动生效；内容不足一屏时滚动条自动隐藏。
+    """
+
+    def __init__(self, master, bg=PANEL, step=3, **kw):
+        super().__init__(master, bg=bg, **kw)
+        self._step = step
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
+                                yscrollincrement=20)
+        self.vsb = tk.Scrollbar(self, orient="vertical", width=10,
+                                command=self.canvas.yview,
+                                bg=PANEL_2, troughcolor="#0a0c12",
+                                activebackground=BORDER)
+        self.canvas.configure(yscrollcommand=self._yscroll)
+        self.content = tk.Frame(self.canvas, bg=bg)
+        self._win = self.canvas.create_window((0, 0), window=self.content,
+                                              anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.content.bind("<Configure>", self._on_content)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        _SCROLL_INSTANCES.append(self)
+        if not _WHEEL_BOUND["done"]:
+            self.bind_all("<MouseWheel>", _wheel_dispatch)
+            self.bind_all("<Button-4>", _wheel_dispatch)  # Linux
+            self.bind_all("<Button-5>", _wheel_dispatch)
+            _WHEEL_BOUND["done"] = True
+
+    def _yscroll(self, first, last):
+        self.vsb.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.vsb.pack_forget()  # 内容不满一屏时隐藏
+        else:
+            self.vsb.pack(side="right", fill="y")
+
+    def _scroll(self, event):
+        d = getattr(event, "delta", 0)
+        if getattr(event, "num", 0) == 4 or d > 0:
+            self.canvas.yview_scroll(-self._step, "units")
+        elif getattr(event, "num", 0) == 5 or d < 0:
+            self.canvas.yview_scroll(self._step, "units")
+        return "break"
+
+    def _on_content(self, _):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._grab_listboxes()
+
+    def _on_canvas(self, e):
+        self.canvas.itemconfigure(self._win, width=e.width)
+
+    def _grab_listboxes(self):
+        """页面内 Listbox 的滚轮改滚整页，避免“列表+面板”双滚动"""
+
+        def wheel(e):
+            return self._scroll(e)
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, tk.Listbox):
+                    c.bind("<MouseWheel>", wheel)
+                walk(c)
+
+        walk(self.content)

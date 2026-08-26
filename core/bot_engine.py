@@ -18,6 +18,7 @@ from core.action_controller import ActionController, MovementController
 # from core.patrol import PatrolNavigator, WALK, JUMP, ROPE_UP, ROPE_DOWN
 from core.color_route import ColorRouteNavigator
 from core.rope_detector import RopeDetector
+from core.imio import imread_u
 
 
 class Mode:
@@ -123,15 +124,16 @@ class BotEngine(threading.Thread):
             )
             # 自动加载地图包路线图（尺寸须与小地图区域一致）
             rp = p.get("route_path", "")
-            if rp and os.path.exists(rp) and rp != self._route_path_loaded:
-                img = cv2.imread(rp)
-                if img is not None:
-                    if img.shape[0] == mm.get("h", 0) and img.shape[1] == mm.get("w", 0):
-                        self.route_nav.load(img)
-                        self._route_path_loaded = rp
-                        self.log(f"颜色路线已加载：{os.path.basename(os.path.dirname(rp))}")
-                    else:
-                        self.log("路线图尺寸与小地图区域不符，请重录小地图并重画路线", "warn")
+            if rp and rp != self._route_path_loaded:
+                img = imread_u(rp)  # 中文路径安全读图
+                if img is None:
+                    self.log(f"路线图不存在或读取失败: {rp}（重新绘制并保存路线可修复）", "warn")
+                elif img.shape[0] == mm.get("h", 0) and img.shape[1] == mm.get("w", 0):
+                    self.route_nav.load(img)
+                    self._route_path_loaded = rp
+                    self.log(f"颜色路线已加载：{os.path.basename(os.path.dirname(rp))}")
+                else:
+                    self.log("路线图尺寸与小地图区域不符，请重录小地图并重画路线", "warn")
             self.move.bind(self.cfg["keys"])
 
     def load_route(self, route_bgr, path_tag="memory"):

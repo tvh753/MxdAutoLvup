@@ -4,19 +4,20 @@
 # @File    : map_manager.py
 # @Software: MxdAutoLvup
 
+# -*- coding: utf-8 -*-
 """地图包：小地图底图 + 颜色路线 + 怪物模板 + 专属配置 打包复用
-
 maps/<名称>/
-  ├── minimap.png   小地图底图（编辑/显示）
-  ├── route.png     颜色路线层（黑底+标记色）
-  ├── profile.json  专属配置（按键/血蓝条/检测区域/巡逻参数…）
+  ├── minimap.png   小地图底图
+  ├── route.png     颜色路线层
+  ├── profile.json  专属配置
   └── monsters/     该地图怪物模板
+所有图片 IO 走 imio（中文路径安全）；保存后 config.json 与 profile
+统一指向包内文件，杜绝“两套路径”。
 """
 import os
 import json
 import shutil
-import cv2
-
+from core.imio import imread_u, imwrite_u
 from core.config_manager import deep_merge
 
 
@@ -34,15 +35,42 @@ class MapManager:
     def _path(self, name, *parts):
         return os.path.join(self.maps_dir, name, *parts)
 
+    @staticmethod
+    def _copy_into_pack(src, pack_dir):
+        """模板拷入地图包，返回包内路径；源丢失但包内有旧副本时沿用副本
+        （支持对同一地图包反复保存）；src==dst 时跳过拷贝防 SameFileError。"""
+        if not src:
+            return None
+        dst = os.path.join(pack_dir, "monsters", os.path.basename(src))
+        if os.path.exists(src):
+            if os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst)
+            return dst
+        if os.path.exists(dst):
+            return dst
+        return None
+
     # ---------- 保存 ----------
     def save(self, name, cfg, minimap_img, route_img):
         d = self._path(name)
         os.makedirs(os.path.join(d, "monsters"), exist_ok=True)
-        if minimap_img is not None:
-            cv2.imwrite(self._path(name, "minimap.png"), minimap_img)
-        if route_img is not None:
-            cv2.imwrite(self._path(name, "route.png"), route_img)
-
+        if minimap_img is not None and not imwrite_u(self._path(name, "minimap.png"),
+                                                     minimap_img):
+            raise IOError(f"小地图底图写入失败: {d}")
+        if route_img is not None and not imwrite_u(self._path(name, "route.png"),
+                                                   route_img):
+            raise IOError(f"路线图写入失败: {d}")
+        monsters = []
+        for t in cfg.get("monster_templates", []):
+            dst = self._copy_into_pack(t.get("path"), d)
+            if dst:
+                monsters.append({"name": t.get("name", "怪物"), "path": dst})
+        player = None
+        pt = cfg.get("player_template")
+        if pt:
+            dst = self._copy_into_pack(pt.get("path"), d)
+            if dst:
+                player = {"name": pt.get("name", "玩家"), "path": dst}
         profile = {
             "window_title": cfg.get("window_title", ""),
             "keys": cfg.get("keys", {}),
@@ -60,36 +88,28 @@ class MapManager:
                 "route_path": self._path(name, "route.png"),
                 "current_map": name,
             },
-            "monster_templates": [],
-            "player_template": None,
+            "monster_templates": monsters,
+            "player_template": player,
         }
-        for t in cfg.get("monster_templates", []):        # 怪物模板拷入包内
-            src = t.get("path")
-            if src and os.path.exists(src):
-                dst = os.path.join(d, "monsters", os.path.basename(src))
-                shutil.copy2(src, dst)
-                profile["monster_templates"].append({"name": t["name"], "path": dst})
-        pt = cfg.get("player_template")
-        if pt and pt.get("path") and os.path.exists(pt["path"]):
-            dst = os.path.join(d, "monsters", os.path.basename(pt["path"]))
-            shutil.copy2(pt["path"], dst)
-            profile["player_template"] = {"name": pt["name"], "path": dst}
-
         with open(self._path(name, "profile.json"), "w", encoding="utf-8") as f:
             json.dump(profile, f, ensure_ascii=False, indent=2)
+        # ★ 关键：config.json 同步指向包内文件，保存/加载/重存一套路径
+        cfg["monster_templates"] = monsters
+        cfg["player_template"] = player
         return profile
 
     # ---------- 加载 ----------
     def load(self, name, cfg):
+        """成功返回，missing 为缺失文件名列表（供日志提示）"""
         pfile = self._path(name, "profile.json")
         if not os.path.exists(pfile):
-            return False
+            return False, []
         try:
             with open(pfile, "r", encoding="utf-8") as f:
                 profile = json.load(f)
         except Exception:
-            return False
-        profile["patrol"]["route_path"] = self._path(name, "route.png")
+            return False, []
+        profile.setdefault("patrol", {})["route_path"] = self._path(name, "route.png")
         for key in ("window_title", "keys", "detect_region", "hp_bar", "mp_bar",
                     "exp_bar", "monster_templates", "player_template"):
             if key in profile:
@@ -97,17 +117,29 @@ class MapManager:
         cur = dict(cfg.get("patrol", {}))
         deep_merge(cur, profile.get("patrol", {}))
         cfg["patrol"] = cur
-        return True
+        missing = [t["name"] for t in cfg.get("monster_templates", [])
+                   if not os.path.exists(t.get("path", ""))]
+        pt = cfg.get("player_template")
+        if pt and not os.path.exists(pt.get("path", "")):
+            missing.append(pt.get("name", "玩家"))
+        rp = cfg["patrol"].get("route_path", "")
+        if rp and not os.path.exists(rp):
+            missing.append("route.png(路线图)")
+        mm = self._path(name, "minimap.png")
+        if not os.path.exists(mm):
+            missing.append("minimap.png(小地图底图)")
+        return True, missing
 
     def load_minimap(self, name):
-        return cv2.imread(self._path(name, "minimap.png"))
+        return imread_u(self._path(name, "minimap.png"))
 
     def load_route(self, name):
-        return cv2.imread(self._path(name, "route.png"))
+        return imread_u(self._path(name, "route.png"))
 
     def save_route(self, name, route_img):
         if route_img is not None:
-            cv2.imwrite(self._path(name, "route.png"), route_img)
+            return imwrite_u(self._path(name, "route.png"), route_img)
+        return False
 
     def delete(self, name):
         d = self._path(name)
