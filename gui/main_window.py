@@ -15,9 +15,12 @@ from gui.theme import *
 from gui.widgets import NeoButton, Bar, KeyEntry
 from gui.region_selector import RegionSelector
 from gui.route_editor import RouteEditor
-from core.config_manager import ConfigManager, TEMPLATE_DIR
+# from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
 from core.bot_engine import BotEngine, Mode
 from core.window_capture import WindowCapture
+from gui.route_painter import RoutePainter
+from core.map_manager import MapManager
+from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
 
 
 class App(tk.Tk):
@@ -26,6 +29,7 @@ class App(tk.Tk):
         ("普通攻击", "attack"), ("技能1", "skill1"), ("技能2", "skill2"), ("技能3", "skill3"),
         ("红药", "hp_potion"), ("蓝药", "mp_potion"),
         ("左移", "move_left"), ("右移", "move_right"), ("跳跃", "jump"),
+        ("上(抓绳)", "up"), ("下(下绳)", "down"), ("传送(法师)", "teleport"),
     ]
 
     def __init__(self):
@@ -43,6 +47,9 @@ class App(tk.Tk):
 
         self.engine = BotEngine(self.cfg, lambda m, lv="info": self.log_queue.put(
             (time.strftime("%H:%M:%S"), m, lv)))
+        self.maps = MapManager(ROOT)
+        self._minimap_snap = None  # 当前小地图底图（录制）
+        self._route_img = None  # 当前颜色路线层
         self.engine.start()
 
         self._build_style()
@@ -200,46 +207,60 @@ class App(tk.Tk):
         tk.Label(body, text="提示：满血/满蓝时完整框选整条状态条（含空槽），颜色自动识别",
                  fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(4, 0))
 
-        # 巡逻路线
-        box, body = self._section(tab, "🗺 巡逻路线（沿小地图路点边走边打）")
+        # 地图包 & 颜色路线
+        box, body = self._section(tab, "🗺 地图包 · 颜色路线（录制一次，处处复用）")
         box.pack(fill="x", padx=8, pady=(4, 8))
         row = tk.Frame(body, bg=PANEL_2);
         row.pack(fill="x")
-        NeoButton(row, "🧭 校准小地图", command=self.calibrate_minimap).pack(side="left")
-        NeoButton(row, "✏ 编辑路线", command=self.edit_route,
-                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(6, 0))
-        NeoButton(row, "🗑 清空路线", command=self.clear_route,
-                  bg="#3a3f55", fg=TEXT).pack(side="left", padx=(6, 0))
+        self.maps_combo = ttk.Combobox(row, state="readonly", width=11)
+        self.maps_combo.pack(side="left")
+        NeoButton(row, "⟳", command=self.refresh_maps, bg=PANEL, fg=TEXT,
+                  padx=9).pack(side="left", padx=(4, 0))
+        NeoButton(row, "📦 加载", command=self.load_map_pack, padx=10).pack(side="left", padx=(4, 0))
+        NeoButton(row, "💾 存为地图包", command=self.save_map_pack,
+                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(4, 0))
+        NeoButton(row, "🗑", command=self.delete_map_pack, bg="#3a3f55",
+                  fg=TEXT, padx=9).pack(side="left", padx=(4, 0))
         row2 = tk.Frame(body, bg=PANEL_2);
         row2.pack(fill="x", pady=(6, 0))
+        NeoButton(row2, "🧭 校准小地图", command=self.calibrate_minimap).pack(side="left")
+        NeoButton(row2, "📷 录制小地图", command=self.record_minimap).pack(side="left", padx=(6, 0))
+        NeoButton(row2, "🎨 绘制颜色路线", command=self.paint_route,
+                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(6, 0))
+        row3 = tk.Frame(body, bg=PANEL_2);
+        row3.pack(fill="x", pady=(6, 0))
         self.patrol_var = tk.BooleanVar(
             value=self.cfg.get("patrol", {}).get("enabled", False))
-        tk.Checkbutton(row2, text="启用路线巡逻", variable=self.patrol_var,
+        tk.Checkbutton(row3, text="启用路线巡逻", variable=self.patrol_var,
                        bg=PANEL_2, fg=TEXT, selectcolor="#141722",
                        activebackground=PANEL_2, activeforeground=TEXT,
                        font=(FONT, 9),
                        command=lambda: self._toggle_patrol(self.patrol_var)).pack(side="left")
-        tk.Label(row2, text="（不启用则左右找怪）", fg=TEXT_DIM, bg=PANEL_2,
-                 font=(FONT, 8)).pack(side="left", padx=(6, 0))
+        tk.Label(row3, text="（颜色即指令：红左走·蓝右走·橙左跳·灰上爬绳…）",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(side="left", padx=(6, 0))
         self.patrol_label = tk.Label(body, text="", fg=TEXT_DIM, bg=PANEL_2,
                                      font=(FONT, 9))
         self.patrol_label.pack(anchor="w", pady=(4, 0))
+        self.refresh_maps()
         self.refresh_patrol_label()
 
     def _build_key_tab(self, tab):
         box, body = self._section(tab, "⌨ 按键映射（点击输入框 → 按键盘按键）")
         box.pack(fill="x", padx=8, pady=8)
+        self._key_entries = {}
         for i, (label, key) in enumerate(self.KEY_ROWS):
             r, c = divmod(i, 2)
             cell = tk.Frame(body, bg=PANEL_2)
             cell.grid(row=r, column=c, sticky="w", padx=(0, 14), pady=5)
             tk.Label(cell, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
                      width=6, anchor="w").pack(side="left")
-            KeyEntry(cell, value=self.cfg["keys"].get(key, ""),
-                     on_change=lambda v, k=key: self._set_key(k, v)).pack(side="left")
+            ent = KeyEntry(cell, value=self.cfg["keys"].get(key, ""),
+                           on_change=lambda v, k=key: self._set_key(k, v))
+            ent.pack(side="left")
+            self._key_entries[key] = ent
         tk.Label(body, text="支持：字母 / 数字 / F1-F12 / 方向键 / ALT / SHIFT / INSERT / HOME 等",
                  fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def _build_param_tab(self, tab):
         box, body = self._section(tab, "🎚 识别与策略参数")
@@ -277,6 +298,28 @@ class App(tk.Tk):
                            activeforeground=TEXT, font=(FONT, 9), anchor="w",
                            command=lambda k=key, v=var: (self.cfg["options"].__setitem__(
                                k, v.get()), self.cfg_mgr.save())).pack(fill="x", pady=1)
+
+        box3, body3 = self._section(tab, "🗺 巡逻微调")
+        box3.pack(fill="x", padx=8, pady=(0, 8))
+        def pslider(label, frm, to, key, default, fmt="{:.0f}"):
+            p = self.cfg.setdefault("patrol", {})
+            row = tk.Frame(body3, bg=PANEL_2);
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                     width=9, anchor="w").pack(side="left")
+            vl = tk.Label(row, text=fmt.format(p.get(key, default)),
+                          bg=PANEL_2, fg=ACCENT, font=(MONO, 9, "bold"), width=6)
+            vl.pack(side="right")
+            sc = ttk.Scale(row, from_=frm, to=to, value=p.get(key, default),
+                           command=lambda v: (p.__setitem__(key, round(float(v), 2)),
+                                              vl.config(text=fmt.format(float(v)))))
+            sc.pack(side="left", fill="x", expand=True, padx=(4, 8))
+            sc.bind("<ButtonRelease-1>", lambda e: (self.cfg_mgr.save(),
+                                                    self.engine.reload_runtime()))
+
+        pslider("搜索半径", 4, 25, "search_range", 10)
+        pslider("抓绳容差", 2, 10, "grab_tol", 4)
+
 
     # ---------- 右侧：预览 + 状态 + 日志 ----------
     def _build_right(self, right):
@@ -492,61 +535,141 @@ class App(tk.Tk):
             self.log(f"小地图校准完成 ({w}×{h})"
                      + (f" · 玩家点颜色已采样 {color}" if color
                         else " · 未检出黄点，使用默认黄色，可稍后重新校准"), "ok")
+            self.record_minimap()  # 校准后顺手录制底图
 
         RegionSelector(self, frame, mode="region", on_ok=ok,
                        tip="框选小地图的【地图区域】（不含标题文字，尽量贴紧边界）")
 
-    def edit_route(self):
-        p = self._patrol_cfg()
-        mm = p.get("minimap", {})
+    # ---------- 地图包 / 颜色路线 ----------
+    def refresh_maps(self):
+        maps = self.maps.list_maps()
+        self.maps_combo["values"] = maps
+        cur = self.cfg.get("patrol", {}).get("current_map", "")
+        if cur in maps:
+            self.maps_combo.set(cur)
+        elif maps:
+            self.maps_combo.current(0)
+
+    def record_minimap(self):
+        mm = self.cfg.get("patrol", {}).get("minimap", {})
         if mm.get("w", 0) < 5:
-            messagebox.showwarning("提示", "请先「校准小地图」，再编辑路线", parent=self)
+            messagebox.showwarning("提示", "请先「校准小地图」", parent=self)
             return
         frame = self._grab_frame()
         if frame is None:
             return
-        crop = frame[mm["y"]:mm["y"] + mm["h"],
-               mm["x"]:mm["x"] + mm["w"]].copy()
-        dot = self.engine.nav.player_pos(frame)  # 黄点闪烁 → 多试几帧
-        if dot is None:
-            for _ in range(4):
-                time.sleep(0.12)
-                f2 = self.engine.capture.screenshot()
-                if f2 is not None and self.engine.nav.player_pos(f2) is not None:
-                    dot = self.engine.nav.player_pos(f2)
-                    break
+        self._minimap_snap = frame[mm["y"]:mm["y"] + mm["h"],
+                             mm["x"]:mm["x"] + mm["w"]].copy()
+        if self._route_img is not None and \
+                self._route_img.shape != self._minimap_snap.shape:
+            self._route_img = None  # 尺寸变了，旧路线作废
+        self.log(f"小地图底图已录制 ({mm['w']}×{mm['h']})，可「绘制颜色路线」", "ok")
 
-        def ok(res):
-            p["waypoints"] = res["waypoints"]
-            p["mode"] = res["mode"]
-            if len(res["waypoints"]) >= 2:
-                p["enabled"] = True  # 布好路线自动启用
-            self.cfg_mgr.save()
-            self.engine.reload_runtime()
+    def paint_route(self):
+        if self._minimap_snap is None:  # 尝试从当前地图包取底图
+            name = self.cfg.get("patrol", {}).get("current_map", "")
+            if name:
+                self._minimap_snap = self.maps.load_minimap(name)
+        if self._minimap_snap is None:
+            messagebox.showwarning("提示", "请先「录制小地图」", parent=self)
+            return
+
+        def ok(route_img):
+            self._route_img = route_img
+            name = self.cfg.get("patrol", {}).get("current_map", "")
+            if name:  # 已关联地图包 → 直接落盘
+                rp = os.path.join(self.maps.maps_dir, name, "route.png")
+                self.maps.save_route(name, route_img)
+                self.cfg.setdefault("patrol", {})["route_path"] = rp
+                self.cfg_mgr.save()
+                self.engine.load_route(route_img, path_tag=rp)
+                self.log(f"路线已保存到地图包「{name}」", "ok")
+            else:
+                self.engine.load_route(route_img)
+                self.log("路线已生效（存为地图包后可持久复用）", "ok")
             self.refresh_patrol_label()
-            self.log(f"路线已保存：{len(res['waypoints'])} 个路点 · "
-                     f"{'往返' if res['mode'] == 'pingpong' else '循环'}模式 · 已自动启用", "ok")
 
-        RouteEditor(self, crop, waypoints=p.get("waypoints"),
-                    mode=p.get("mode", "pingpong"), player_dot=dot, on_ok=ok)
+        RoutePainter(self, self._minimap_snap, self._route_img, on_ok=ok)
 
-    def clear_route(self):
-        self._patrol_cfg()["waypoints"] = []
+    def save_map_pack(self):
+        if self._minimap_snap is None:
+            messagebox.showwarning("提示", "请先「录制小地图」再保存地图包", parent=self)
+            return
+        name = simpledialog.askstring("地图包命名", "地图名称（如：蘑菇山）：", parent=self)
+        if not name:
+            return
+        if name in self.maps.list_maps() and not messagebox.askyesno(
+                "覆盖确认", f"地图包「{name}」已存在，覆盖保存？", parent=self):
+            return
+        self.maps.save(name, self.cfg, self._minimap_snap, self._route_img)
+        p = self.cfg.setdefault("patrol", {})
+        p["current_map"] = name
+        p["route_path"] = os.path.join(self.maps.maps_dir, name, "route.png")
+        p["enabled"] = True
         self.cfg_mgr.save()
         self.engine.reload_runtime()
+        self.refresh_maps()
         self.refresh_patrol_label()
-        self.log("巡逻路线已清空", "warn")
+        self.patrol_var.set(True)
+        self.log(f"🗺 地图包「{name}」已保存（路线+怪物模板+配置），巡逻已自动启用", "ok")
+
+    def load_map_pack(self):
+        name = self.maps_combo.get()
+        if not name:
+            messagebox.showwarning("提示", "请先选择地图包", parent=self)
+            return
+        self.engine.invalidate_route_cache()
+        if not self.maps.load(name, self.cfg):
+            messagebox.showerror("错误", "地图包加载失败（profile.json 缺失）", parent=self)
+            return
+        self._minimap_snap = self.maps.load_minimap(name)
+        self._route_img = self.maps.load_route(name)
+        self.cfg_mgr.save()
+        self.engine.reload_runtime()
+        # 同步 UI 控件
+        for k, ent in self._key_entries.items():
+            ent.var.set(self.cfg["keys"].get(k, "-"))
+        self.patrol_var.set(self.cfg.get("patrol", {}).get("enabled", False))
+        self.refresh_tpl_list()
+        self.refresh_maps()
+        self.refresh_patrol_label()
+        self.log(f"📦 地图包「{name}」已加载：怪物模板 "
+                 f"{len(self.cfg['monster_templates'])} 个 · "
+                 f"路线 {'✓' if self._route_img is not None else '✗'} · "
+                 f"血条/按键配置已恢复", "ok")
+        # 自动绑定窗口
+        wt = self.cfg.get("window_title", "")
+        if wt and not self.engine.window_bound():
+            if self.engine.bind_window(wt):
+                self.engine.set_mode(Mode.PREVIEW)
+                self.win_label.config(text=f"✅ {self.engine.capture.window_title}",
+                                      fg=GREEN)
+
+    def delete_map_pack(self):
+        name = self.maps_combo.get()
+        if not name or not messagebox.askyesno(
+                "删除确认", f"确定删除地图包「{name}」？", parent=self):
+            return
+        self.maps.delete(name)
+        if self.cfg.get("patrol", {}).get("current_map") == name:
+            self.cfg["patrol"]["current_map"] = ""
+            self.cfg["patrol"]["route_path"] = ""
+            self.cfg_mgr.save()
+            self.engine.reload_runtime()
+        self.refresh_maps()
+        self.refresh_patrol_label()
+        self.log(f"地图包「{name}」已删除", "warn")
 
     def refresh_patrol_label(self):
         p = self.cfg.get("patrol", {})
         mm = p.get("minimap", {})
-        wp = p.get("waypoints", [])
-        parts = ["小地图 ✓" if mm.get("w", 0) > 4 else "小地图 ✗", f"路点 {len(wp)}"]
-        if wp:
-            parts.append("往返" if p.get("mode") == "pingpong" else "循环")
-        parts.append("已启用" if p.get("enabled") else "未启用")
-        ok = mm.get("w", 0) > 4 and len(wp) >= 2 and p.get("enabled")
-        self.patrol_label.config(text=" · ".join(parts), fg=TEXT if ok else TEXT_DIM)
+        parts = [f"地图: {p.get('current_map') or '未关联'}",
+                 "小地图 ✓" if mm.get("w", 0) > 4 else "小地图 ✗",
+                 "路线 ✓" if self.engine.route_nav.ready else "路线 ✗",
+                 "已启用" if p.get("enabled") else "未启用"]
+        ok = mm.get("w", 0) > 4 and self.engine.route_nav.ready and p.get("enabled")
+        self.patrol_label.config(text=" · ".join(parts),
+                                 fg=TEXT if ok else TEXT_DIM)
 
     def _toggle_patrol(self, var):
         self._patrol_cfg()["enabled"] = var.get()
@@ -571,9 +694,8 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self); return
         if not self.cfg["monster_templates"]:
             messagebox.showwarning("提示", "请至少框选一个怪物模板", parent=self); return
-        p = self.cfg.get("patrol", {})
-        if p.get("enabled") and not self.engine.nav.ready:
-            self.log("⚠ 已勾选路线巡逻但小地图/路点未配置齐全，将退回左右找怪", "warn")
+        if self.cfg.get("patrol", {}).get("enabled") and not self.engine.route_nav.ready:
+            self.log("⚠ 已勾选巡逻但颜色路线未就绪（校准小地图→绘制路线），将退回左右找怪", "warn")
         if not self.cfg["hp_bar"].get("w"):
             self.log("⚠ 尚未校准HP条，血量监控将不可用", "warn")
         self.cfg_mgr.save(); self.engine.reload_runtime()

@@ -21,6 +21,8 @@ DEFAULT_CONFIG = {
         "attack": "q", "skill1": "q", "skill2": "q", "skill3": "q",
         "hp_potion": "1", "mp_potion": "2",
         "move_left": "left", "move_right": "right", "jump": "alt",
+        "up": "up", "down": "down",          # ← 新增：抓绳/爬绳
+        "teleport": "shift",              # ← 新增：法师瞬移
     },
     "thresholds": {
         "match": 0.80, "hp_potion": 55, "mp_potion": 35, "hp_stop": 12,
@@ -35,10 +37,10 @@ DEFAULT_CONFIG = {
         "minimap": {"x": 0, "y": 0, "w": 0, "h": 0},
         "player_dot_color": [60, 230, 255],
         "dot_tolerance": 80,
-        "waypoints": [],  # [[mx, my], ...] 小地图坐标
-        "mode": "pingpong",  # pingpong 往返 / loop 循环
-        "arrive_tol": 6,
-        "max_chase_time": 8.0,  # 追击超时，超时回归路线
+        "search_range": 10,  # 玩家周围搜索半径（小地图px）
+        "grab_tol": 4,  # 抓绳水平容差
+        "route_path": "",  # 颜色路线图路径（地图包内）
+        "current_map": "",  # 当前激活地图包名
     },
 }
 

@@ -3,31 +3,51 @@
   "monster_templates": [
     {
       "name": "花蘑菇1",
-      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787747706659.png"
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787747706659.png"
     },
     {
       "name": "蘑菇仔",
-      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787747806112.png"
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787747806112.png"
     },
     {
       "name": "红蜗牛",
-      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787747911442.png"
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787747911442.png"
     },
     {
       "name": "花蘑菇2",
-      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787749017338.png"
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787749017338.png"
+    },
+    {
+      "name": "怪物5",
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787759272209.png"
+    },
+    {
+      "name": "怪物6",
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787759280858.png"
+    },
+    {
+      "name": "怪物7",
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787759295028.png"
+    },
+    {
+      "name": "怪物8",
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787759308412.png"
+    },
+    {
+      "name": "怪物9",
+      "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787759320999.png"
     }
   ],
   "player_template": {
     "name": "玩家",
-    "path": "D:\\test_demo\\MxdAutoLvup\\templates\\player_1787747763470.png"
+    "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\player_1787759202721.png"
   },
   "detect_region": null,
   "hp_bar": {
-    "x": 471,
-    "y": 700,
-    "w": 97,
-    "h": 13,
+    "x": 503,
+    "y": 750,
+    "w": 105,
+    "h": 14,
     "color": [
       40,
       40,
@@ -36,10 +56,10 @@
     "tolerance": 60
   },
   "mp_bar": {
-    "x": 571,
-    "y": 701,
-    "w": 102,
-    "h": 16,
+    "x": 612,
+    "y": 749,
+    "w": 104,
+    "h": 14,
     "color": [
       210,
       110,
@@ -48,10 +68,10 @@
     "tolerance": 60
   },
   "exp_bar": {
-    "x": 0,
-    "y": 0,
-    "w": 0,
-    "h": 0
+    "x": 724,
+    "y": 750,
+    "w": 116,
+    "h": 16
   },
   "keys": {
     "attack": "q",
@@ -62,7 +82,10 @@
     "mp_potion": "2",
     "move_left": "left",
     "move_right": "right",
-    "jump": "alt"
+    "jump": "alt",
+    "up": "up",
+    "down": "down",
+    "teleport": "shift"
   },
   "thresholds": {
     "match": 0.8,
@@ -80,12 +103,12 @@
     "pause_on_unfocus": true
   },
   "patrol": {
-    "enabled": false,
+    "enabled": true,
     "minimap": {
-      "x": 3,
-      "y": 1,
-      "w": 157,
-      "h": 150
+      "x": 2,
+      "y": 2,
+      "w": 170,
+      "h": 159
     },
     "player_dot_color": [
       17,
@@ -93,26 +116,16 @@
       221
     ],
     "dot_tolerance": 80,
-    "waypoints": [
-      [
-        126,
-        109
-      ],
-      [
-        24,
-        110
-      ],
-      [
-        26,
-        80
-      ],
-      [
-        108,
-        77
-      ]
-    ],
+    "search_range": 10,
+    "grab_tol": 4,
+    "route_path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\route.png",
+    "current_map": "蘑菇山",
+    "waypoints": [],
     "mode": "loop",
     "arrive_tol": 6,
+    "air_time": 0.55,
+    "grab_timeout": 0.9,
+    "max_grab_retries": 3,
     "max_chase_time": 8.0
   }
 }
