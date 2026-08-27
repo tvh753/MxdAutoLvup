@@ -308,7 +308,7 @@ class BotEngine(threading.Thread):
         self._draw_boxes(ann)
         st["monsters"] = len(monsters)
 
-        player_map = self.route_nav.player_pos(frame) \
+        player_map = self.route_nav.player_pos(frame,self._player_tpl,self.detector) \
             if self.route_nav.minimap[2] > 4 else None
         self._last_map_pos = player_map
         self._draw_patrol(ann, player_map)
@@ -330,7 +330,7 @@ class BotEngine(threading.Thread):
             st["action"] = "已暂停" if self.mode == Mode.PAUSED else "监控中"
 
         self._push_preview(ann)
-
+z
     # ============ 内部实现 ============
     def _check_focus(self):
         if not self.cfg["options"].get("pause_on_unfocus", True):

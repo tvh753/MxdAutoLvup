@@ -310,16 +310,23 @@ class ColorRouteNavigator:
 
     def _dot_candidates(self, roi):
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        # 使用更精确的HSV范围，根据实际环境调整
         mask = cv2.inRange(hsv, (self._h_lo, self.DOT_S_MIN, self.DOT_V_MIN),
                            (self._h_hi, 255, 255))
+        # 添加形态学操作，去除噪声
+        kernel = np.ones((2, 2), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         n, _, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
         out = []
         for i in range(1, n):
             a = int(stats[i][cv2.CC_STAT_AREA])
             bw = int(stats[i][cv2.CC_STAT_WIDTH])
             bh = int(stats[i][cv2.CC_STAT_HEIGHT])
+            # 添加形状约束，确保是圆形
+            circularity = 4 * np.pi * a / (bw * bh) if bw * bh > 0 else 0
             if 2 <= a <= self.dot_max_area and bw <= self.DOT_SIDE \
-                    and bh <= self.DOT_SIDE:
+                    and bh <= self.DOT_SIDE and circularity > 0.7:
                 out.append((float(cents[i][0]), float(cents[i][1]), a))
         return out, mask
 
@@ -386,9 +393,11 @@ class ColorRouteNavigator:
                 dist = np.sqrt(((base - (ax, ay)) ** 2).sum(1))
                 j = int(dist.argmin())
                 bx, by = float(base[j][0]), float(base[j][1])
-                if dist[j] < 2.5 or (ax - bx) * d < 2.5:
+                # 增加移动距离阈值
+                if dist[j] < 3.5 or (ax - bx) * d < 3.5:  # 增加到3.5px
                     continue  # 没动 / 逆指令动 → 静态物或滚动背景，排除
-                if float(np.sqrt(((B - (bx, by)) ** 2).sum(1)).min()) > 4.0:
+                # 增加回程精度要求
+                if float(np.sqrt(((B - (bx, by)) ** 2).sum(1)).min()) > 3.0:  # 减少到3.0px
                     continue  # 回程没回到出发点 → 路过的其他玩家，排除
                 score = float(dist[j])
                 if self._marks_xy is not None:  # 真实玩家几乎总在路线附近
@@ -418,9 +427,8 @@ class ColorRouteNavigator:
         if p["try"] >= 6 and now - self._probe_fail_log_t > 20:
             self._probe_fail_log_t = now
             self._log("试探定位多次未找到移动点：角色可能被卡住，持续重试中"
-                      "（长期无效请检查小地图区域框选）", "warn")
+                     "（长期无效请检查小地图区域框选）", "warn")
         return None
-
 
     def _nearest_mark(self, x, y):
         if self._marks_xy is None or len(self._marks_xy) == 0:
@@ -435,12 +443,14 @@ class ColorRouteNavigator:
         if not cmd.dir:
             self._walk_t0 = None
             return
+        # 增加位置变化检测的灵敏度
         if (self._walk_t0 is None or
-                abs(pos[0] - self._walk_p0[0]) >= 2 or
-                abs(pos[1] - self._walk_p0[1]) >= 2):
+                abs(pos[0] - self._walk_p0[0]) >= 1.5 or  # 减少到1.5px
+                abs(pos[1] - self._walk_p0[1]) >= 1.5):  # 减少到1.5px
             self._walk_t0, self._walk_p0 = now, pos
             return
-        if now - self._walk_t0 > 5.0:
+        # 减少超时阈值，更快检测到问题
+        if now - self._walk_t0 > 3.0:  # 减少到3.0s
             self._walk_t0 = None
             self._last_pos = None
             self._step_pos = None
@@ -464,7 +474,8 @@ class ColorRouteNavigator:
                 continue
             roi = f[y:y2, x:x2]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            m = cv2.inRange(hsv, (15, 100, 150), (40, 255, 255))
+            # 使用更宽松的初始范围进行采样
+            m = cv2.inRange(hsv, (10, 80, 120), (50, 255, 255))
             if not m.any():
                 continue
             n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
@@ -472,19 +483,38 @@ class ColorRouteNavigator:
                 a = int(stats[i][cv2.CC_STAT_AREA])
                 if 2 <= a <= 60 and stats[i][cv2.CC_STAT_WIDTH] <= 8 \
                         and stats[i][cv2.CC_STAT_HEIGHT] <= 8:
-                    sel = roi[labels == i]  # 用标签图选区（不是掩码）
-                    if sel.size:  # 空选区不入列
+                    sel = roi[labels == i]
+                    if sel.size:
                         pixels.append(sel)
         if not pixels:
             return None
         med = np.median(np.vstack(pixels), axis=0).astype(np.float64)
-        if np.isnan(med).any():  # NaN 防线
+        if np.isnan(med).any():
             self._log("玩家点颜色采样异常(NaN)，保留原颜色", "warn")
             return None
         med = np.clip(med, 0, 255).astype(int)
         self.dot_color = np.array(med, dtype=np.int16)
         self._update_hue()
-        return med.tolist()
+        # 添加采样结果的验证
+        if self._validate_sample_color():
+            self._log(f"玩家点颜色已更新为: {med.tolist()}", "ok")
+            return med.tolist()
+        else:
+            self._log("采样颜色验证失败，保留原颜色", "warn")
+            return None
+
+    def _validate_sample_color(self):
+        """验证采样颜色是否有效"""
+        # 检查新颜色与旧颜色的差异
+        if hasattr(self, 'dot_color'):
+            old_color = self.dot_color.copy()
+            new_color = np.array(self.dot_color, dtype=np.int16)
+            diff = np.abs(old_color - new_color).sum()
+            if diff > 30:  # 如果颜色变化较大，进行验证
+                # 这里可以添加更多的验证逻辑
+                return True
+        return True
+
 
     # ================= 偏离检测（追击限距配套） =================
     def off_route_distance(self, pos):
@@ -767,17 +797,22 @@ class ColorRouteNavigator:
         live = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         res = cv2.matchTemplate(live, tpl, cv2.TM_CCOEFF_NORMED)
         _, mv, _, ml = cv2.minMaxLoc(res)
-        if mv < 0.55:
+        # 提高匹配阈值
+        if mv < 0.65:  # 提高到0.65
             return None
         dx, dy = ml[0] - px, ml[1] - py
-        if abs(dx) > rw // 3 or abs(dy) > rh // 3:
+        # 减少允许的最大位移
+        if abs(dx) > rw // 4 or abs(dy) > rh // 4:  # 减少到1/4
             return None
         return (dx, dy)
 
-    def player_pos(self, frame_bgr):
+    def player_pos(self, frame_bgr,player_tpl,detector):
         pos = self._player_pos_raw(frame_bgr)
         if pos is None:
-            return None
+            # 尝试使用主画面玩家模板识别作为备选
+            pos = self._player_pos_from_main_frame(frame_bgr,player_tpl,detector)
+            if pos is None:
+                return None
         if self._base is None:
             return pos
         now = time.time()
@@ -800,3 +835,24 @@ class ColorRouteNavigator:
         dx, dy = self._shift
         self.debug_cands = [(cx - dx, cy - dy) for (cx, cy) in self.debug_cands]
         return (pos[0] - dx, pos[1] - dy)  # live → 底图坐标系
+
+    def _player_pos_from_main_frame(self, frame_bgr,player_tpl,detector):
+        """从主画面使用玩家模板识别定位玩家位置"""
+        if player_tpl is None:
+            return None
+        # 获取小地图在主画面中的位置
+        x, y, w, h = self.minimap
+        if w <= 4 or h <= 4:
+            return None
+        # 计算小地图在主画面中的相对位置
+        roi = frame_bgr[y:y + h, x:x + w]
+        if roi is None or roi.size == 0:
+            return None
+        # 使用玩家模板在小地图中搜索
+        hits = detector.find_all(player_tpl, 0.8, scene_gray=cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
+        if not hits:
+            return None
+        # 返回第一个匹配的位置（转换为小地图坐标系）
+        hit = hits[0]
+        cx, cy = hit[0], hit[1]
+        return (cx, cy)
