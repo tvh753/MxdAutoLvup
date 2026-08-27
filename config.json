@@ -36,6 +36,30 @@
     {
       "name": "怪物9",
       "path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\monsters\\1787759320999.png"
+    },
+    {
+      "name": "怪物10",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787780624784.png"
+    },
+    {
+      "name": "怪物11",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787780647414.png"
+    },
+    {
+      "name": "怪物12",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787780662431.png"
+    },
+    {
+      "name": "怪物13",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787780678961.png"
+    },
+    {
+      "name": "怪物14",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787780727038.png"
+    },
+    {
+      "name": "怪物15",
+      "path": "D:\\test_demo\\MxdAutoLvup\\templates\\1787780773370.png"
     }
   ],
   "player_template": {
@@ -75,9 +99,9 @@
   },
   "keys": {
     "attack": "q",
-    "skill1": "q",
-    "skill2": "q",
-    "skill3": "q",
+    "skill1": "",
+    "skill2": "",
+    "skill3": "",
     "hp_potion": "1",
     "mp_potion": "2",
     "move_left": "left",
@@ -85,7 +109,8 @@
     "jump": "alt",
     "up": "up",
     "down": "down",
-    "teleport": "shift"
+    "teleport": "shift",
+    "pickup": "z"
   },
   "thresholds": {
     "match": 0.8,
@@ -94,13 +119,16 @@
     "hp_stop": 12,
     "attack_range": 160,
     "potion_cooldown": 1.2,
-    "roam_interval": 2.5
+    "roam_interval": 2.5,
+    "skill_range": 260,
+    "pickup_interval": 0.9
   },
   "options": {
     "use_skill_rotation": true,
     "jump_while_roam": true,
     "stop_on_low_hp": true,
-    "pause_on_unfocus": true
+    "pause_on_unfocus": true,
+    "loot_enabled": true
   },
   "patrol": {
     "enabled": true,
@@ -116,10 +144,11 @@
       221
     ],
     "dot_tolerance": 80,
-    "search_range": 10,
-    "grab_tol": 4,
+    "search_range": 12.09,
+    "grab_tol": 5.08,
     "route_path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\route.png",
     "current_map": "蘑菇山",
+    "dot_max_area": 40,
     "waypoints": [],
     "mode": "loop",
     "arrive_tol": 6,
@@ -127,5 +156,12 @@
     "grab_timeout": 0.9,
     "max_grab_retries": 3,
     "max_chase_time": 8.0
+  },
+  "schedule": {
+    "enabled": false,
+    "duration_min": 60,
+    "rest_lo_min": 5,
+    "rest_hi_min": 10,
+    "safe_stop_wait": 120
   }
 }

@@ -23,14 +23,17 @@ DEFAULT_CONFIG = {
         "move_left": "left", "move_right": "right", "jump": "alt",
         "up": "up", "down": "down",          # ← 新增：抓绳/爬绳
         "teleport": "shift",              # ← 新增：法师瞬移
+        "pickup": "z",  # ← 新增：拾取
     },
     "thresholds": {
         "match": 0.80, "hp_potion": 55, "mp_potion": 35, "hp_stop": 12,
         "attack_range": 160, "potion_cooldown": 1.2, "roam_interval": 2.5,
+        "skill_range": 260, "pickup_interval": 0.9
     },
     "options": {
         "use_skill_rotation": True, "jump_while_roam": True,
         "stop_on_low_hp": True, "pause_on_unfocus": True,
+        "loot_enabled": True
     },
     "patrol": {
         "enabled": False,
@@ -41,6 +44,11 @@ DEFAULT_CONFIG = {
         "grab_tol": 4,  # 抓绳水平容差
         "route_path": "",  # 颜色路线图路径（地图包内）
         "current_map": "",  # 当前激活地图包名
+        "dot_max_area": 40,         # 玩家点面积上限（点检测过滤）
+    },
+    "schedule": {
+        "enabled": False, "duration_min": 60,
+        "rest_lo_min": 5, "rest_hi_min": 10, "safe_stop_wait": 120,
     },
 }
 

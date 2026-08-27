@@ -10,6 +10,8 @@ import threading
 import queue
 import cv2
 import os
+import random
+import numpy as np
 
 from core.window_capture import WindowCapture
 from core.detector import TemplateDetector
@@ -57,6 +59,7 @@ class BotEngine(threading.Thread):
         self.rope_det = RopeDetector()  # 主画面绳子识别（精调对位）
         self._rope_t = 0.0
         self._route_path_loaded = None
+        self._nav_base = None
 
         self.mode = Mode.IDLE
         self._stop_flag = False
@@ -74,6 +77,16 @@ class BotEngine(threading.Thread):
         self._last_preview = 0.0
         self._fps_n = 0;
         self._fps_t = time.time()
+
+        self._facing = 1  # 角色朝向（+1右/-1左）
+        self._skill_idx = 0
+        self._loot_t = 0.0
+        self._was_combat = False
+        self._last_map_pos = None
+        self._resting = False  # 定时休息状态
+        self._rest_until = 0.0
+        self._sess_end = None
+        self._grace_until = None
 
     # ============ 对外接口 ============
     def bind_window(self, keyword) -> bool:
@@ -113,28 +126,36 @@ class BotEngine(threading.Thread):
             bar.set(region=(d.get("x", 0), d.get("y", 0),
                             d.get("w", 0), d.get("h", 0)))
 
-            p = self.cfg.get("patrol", {})
-            mm = p.get("minimap", {})
-            self.route_nav.configure(
-                minimap=(mm.get("x", 0), mm.get("y", 0), mm.get("w", 0), mm.get("h", 0)),
-                dot_color=p.get("player_dot_color"),
-                tolerance=p.get("dot_tolerance", 80),
-                search_range=p.get("search_range", 10),
-                grab_tol=p.get("grab_tol", 4),
-            )
-            # 自动加载地图包路线图（尺寸须与小地图区域一致）
-            rp = p.get("route_path", "")
-            if rp and rp != self._route_path_loaded:
-                img = imread_u(rp)  # 中文路径安全读图
-                if img is None:
-                    self.log(f"路线图不存在或读取失败: {rp}（重新绘制并保存路线可修复）", "warn")
-                elif img.shape[0] == mm.get("h", 0) and img.shape[1] == mm.get("w", 0):
-                    self.route_nav.load(img)
-                    self._route_path_loaded = rp
-                    self.log(f"颜色路线已加载：{os.path.basename(os.path.dirname(rp))}")
-                else:
-                    self.log("路线图尺寸与小地图区域不符，请重录小地图并重画路线", "warn")
-            self.move.bind(self.cfg["keys"])
+        p = self.cfg.get("patrol", {})
+        mm = p.get("minimap", {})
+        self.route_nav.configure(
+            minimap=(mm.get("x", 0), mm.get("y", 0), mm.get("w", 0), mm.get("h", 0)),
+            dot_color=p.get("player_dot_color"),
+            tolerance=p.get("dot_tolerance", 80),
+            search_range=p.get("search_range", 10),
+            grab_tol=p.get("grab_tol", 4),
+            dot_max_area=p.get("dot_max_area", 40),
+        )
+        rp = p.get("route_path", "")
+        if rp and rp != self._route_path_loaded:
+            img = imread_u(rp)
+            if img is None:
+                self.log(f"路线图不存在或读取失败: {rp}（重新绘制并保存路线可修复）", "warn")
+                self._nav_base = None
+            elif img.shape[0] == mm.get("h", 0) and img.shape[1] == mm.get("w", 0):
+                self.route_nav.load(img)
+                self._route_path_loaded = rp
+                base = imread_u(os.path.join(os.path.dirname(rp), "minimap.png"))
+                self._nav_base = base if (base is not None and
+                                          base.shape[:2] == img.shape[:2]) else None
+                self.log(f"颜色路线已加载：{os.path.basename(os.path.dirname(rp))}"
+                         + ("" if self._nav_base is not None
+                            else "（无小地图底图，导航面板用暗底）"))
+            else:
+                self.log("路线图尺寸与小地图区域不符，请重录小地图并重画路线", "warn")
+                self._nav_base = None
+        self.move.bind(self.cfg["keys"])
+
 
     def load_route(self, route_bgr, path_tag="memory"):
         """GUI 绘制/加载路线后直接喂入；path_tag 用于缓存判断"""
@@ -207,7 +228,6 @@ class BotEngine(threading.Thread):
 
     def _tick(self):
         frame = self.capture.screenshot()
-
         if frame is None:
             self._none_frames += 1
             if self._none_frames >= 8:
@@ -234,7 +254,7 @@ class BotEngine(threading.Thread):
         self._draw_bar(ann, self.cfg.get("mp_bar", {}), (255, 170, 60), "MP")
         self._draw_bar(ann, self.cfg.get("exp_bar", {}), (60, 220, 255), "EXP")
 
-        # ② 失焦安全 + 自动喝药
+        # ② 失焦安全 + 自动喝药（休息中也喝药保命）
         focused = True
         if self.mode == Mode.RUNNING:
             focused = self._check_focus()
@@ -243,9 +263,9 @@ class BotEngine(threading.Thread):
             else:
                 self._auto_potion(hp, mp)
 
-        # ③ 目标识别（节流，重操作）+ 小地图定位（每帧，便宜）
+        # ③ 目标识别（节流）+ 小地图定位（每帧）
         if now - self._det_t >= self.DET_INTERVAL:
-            self._last_monsters, self._last_player = self._detect(frame, ann)
+            self._last_monsters, self._last_player = self._detect(frame)
             self._det_t = now
         monsters, player = self._last_monsters, self._last_player
         self._draw_boxes(ann)
@@ -253,11 +273,22 @@ class BotEngine(threading.Thread):
 
         player_map = self.route_nav.player_pos(frame) \
             if self.route_nav.minimap[2] > 4 else None
+        self._last_map_pos = player_map
+        self._draw_patrol(ann, player_map)
 
-        # ④ 决策
+        # ④ 决策（含定时休息调度）
         if self.mode == Mode.RUNNING:
-            st["action"] = (self._decide(frame, monsters, player, player_map)
-                            if focused else "失焦保护中")
+            resting = self._schedule_tick(now)
+            if resting:
+                self.move.release_all()
+                remain = max(0.0, self._rest_until - now)
+                st["action"] = f"😴 休息中 剩{int(remain // 60)}分{int(remain % 60):02d}秒"
+            elif focused:
+                st["action"] = self._decide(frame, monsters, player, player_map)
+                if self._grace_until and now < self._grace_until:
+                    st["action"] += " · 寻找安全点"
+            else:
+                st["action"] = "失焦保护中"
         else:
             st["action"] = "已暂停" if self.mode == Mode.PAUSED else "监控中"
 
@@ -287,7 +318,7 @@ class BotEngine(threading.Thread):
             self.set_mode(Mode.PAUSED)
             self.log(f"‼ 血量过低({hp:.0f}%)，触发停机保护！", "error")
 
-    def _detect(self, frame, ann):
+    def _detect(self, frame):
         """模板识别（重操作，由 _tick 节流调用）；标注框存缓存供每帧重绘"""
         self._last_boxes = []
         th = self.cfg["thresholds"]["match"]
@@ -319,6 +350,10 @@ class BotEngine(threading.Thread):
         keys, th = self.cfg["keys"], self.cfg["thresholds"]
         patrol = self.cfg.get("patrol", {})
         now = time.time()
+        # 战斗刚结束 → 立即触发拾取
+        if self._was_combat and not monsters:
+            self._loot_t = 0.0
+        self._was_combat = bool(monsters)
         # ---------- ① 战斗优先 ----------
         if monsters and (self._giveup_until is None or now > self._giveup_until):
             if self._chase_t0 is None:
@@ -329,19 +364,7 @@ class BotEngine(threading.Thread):
                 self.move.release_all()
                 self.log("追击超时，暂离怪物 5 秒，回归巡逻路线", "warn")
             else:
-                anchor = player if player is not None else \
-                    (frame.shape[1] // 2, frame.shape[0] // 2, 1.0, 0, 0)
-                hit, name = min(monsters, key=lambda m: abs(m[0][0] - anchor[0]))
-                dx = hit[0] - anchor[0]
-                if abs(dx) <= th["attack_range"]:
-                    self.move.set_dir(0)
-                    self.move.set_climb(None)
-                    self.route_nav.touch()  # ← 修复点：原 self.nav.touch()
-                    self._attack()
-                    return f"攻击 {name}"
-                self.move.set_climb(None)
-                self.move.set_dir(-1 if dx < 0 else 1)  # 连续追击，匀速接近
-                return f"→ 接近 {name}"
+                return self._combat(frame, monsters, player, now)
         else:
             self._chase_t0 = None
             if self._giveup_until and now > self._giveup_until:
@@ -351,8 +374,9 @@ class BotEngine(threading.Thread):
             cmd = self.route_nav.step(player_map, now)
             if cmd.stop:
                 self.move.release_all()
+                self._try_loot(now)
                 return cmd.status
-            if self.route_nav.phase in ("align", "grab"):  # 主画面绳子精调
+            if self.route_nav.phase in ("align", "grab"):
                 self._rope_assist(frame, cmd, now)
             self.move.set_dir(cmd.dir)
             self.move.set_climb(cmd.climb)
@@ -366,8 +390,8 @@ class BotEngine(threading.Thread):
                         "left": keys.get("move_left"),
                         "right": keys.get("move_right")}.get(cmd.teleport)
                 self.controller.combo(keys.get("teleport"), dkey, hold=0.25)
-            # 停滞脱困（仅普通走位阶段；爬绳状态机有自己的超时逻辑）
-            if self.route_nav.phase == "none" and cmd.dir:
+            if self.route_nav.phase == "none":  # 边走边拾取 + 脱困
+                self._try_loot(now)
                 stuck = self.route_nav.stuck_seconds()
                 if stuck > 3.0 and self.controller.cooldown_ok("unstuck", 2.5):
                     self.controller.tap(keys.get("jump"))
@@ -382,7 +406,112 @@ class BotEngine(threading.Thread):
         self.move.set_dir(self._roam_dir)
         if self.cfg["options"].get("jump_while_roam") and self.controller.cooldown_ok("jump", 3.5):
             self.controller.tap(keys.get("jump"))
+        self._try_loot(now)
         return "巡逻找怪"
+
+    # ================= 战斗（前方普攻 / 周围技能） =================
+    def _combat(self, frame, monsters, player, now):
+        keys, th = self.cfg["keys"], self.cfg["thresholds"]
+        anchor = player if player is not None else \
+            (frame.shape[1] // 2, frame.shape[0] // 2, 1.0, 0, 0)
+        ax = anchor[0]
+        d = self.move.h_dir
+        if d:
+            self._facing = d  # 移动方向即朝向
+        hit, name = min(monsters, key=lambda m: abs(m[0][0] - ax))
+        dx = hit[0] - ax
+        adx = abs(dx)
+        # ① 前方近身 → 普攻
+        if adx <= th["attack_range"]:
+            if dx == 0 or (1 if dx > 0 else -1) == self._facing:
+                self.move.set_dir(0)
+                self.move.set_climb(None)
+                self.route_nav.touch()
+                self._attack()
+                return f"⚔ 攻击 {name}"
+            self.move.set_dir(0)  # 背后 → 松键轻点反向转身
+            self.move.set_climb(None)
+            self.controller.tap(keys["move_left"] if dx < 0 else keys["move_right"],
+                                hold=0.06)
+            self._facing = 1 if dx > 0 else -1
+            return f"↩ 转身 → {name}"
+        # ② 技能（仅配置了技能键时，攻击周围目标）
+        skills = [keys[k] for k in ("skill1", "skill2", "skill3") if keys.get(k)]
+        if skills and adx <= th.get("skill_range", 260) and \
+                self.controller.cooldown_ok("skill", 0.3):
+            self.move.set_dir(0)
+            self.move.set_climb(None)
+            self.route_nav.touch()
+            self.controller.tap(skills[self._skill_idx % len(skills)])
+            self._skill_idx += 1
+            return f"✨ 技能攻击 {name}"
+        # ③ 接近目标
+        self.move.set_climb(None)
+        self.move.set_dir(-1 if dx < 0 else 1)
+        return f"→ 接近 {name}"
+
+    # ================= 边走边拾取 =================
+    def _try_loot(self, now):
+        if not self.cfg["options"].get("loot_enabled", True):
+            return
+        key = self.cfg["keys"].get("pickup")
+        if not key:
+            return
+        if now - self._loot_t < self.cfg["thresholds"].get("pickup_interval", 0.9):
+            return
+        self._loot_t = now
+        self.controller.tap(key, hold=0.04)
+
+    # ================= 定时挂机 / 休息调度 =================
+    def _schedule_tick(self, now):
+        """返回 True = 休息中（跳过战斗与巡逻决策）"""
+        sch = self.cfg.get("schedule", {})
+        if not sch.get("enabled"):
+            self._resting = False
+            self._sess_end = None
+            self._grace_until = None
+            return False
+        if self._resting:
+            if now >= self._rest_until:
+                self._resting = False
+                self._start_session(now)
+                self.log("😴 休息结束，开始新一轮挂机", "ok")
+            return self._resting
+        if self._sess_end is None:
+            self._start_session(now)
+        elif now >= self._sess_end:  # 本轮结束 → 找安全点休息
+            if self.route_nav.has_stop:
+                if self._grace_until is None:
+                    self._grace_until = now + sch.get("safe_stop_wait", 120)
+                    self.log("本轮挂机结束，走向停止标记(安全点)…", "info")
+                if now < self._grace_until:
+                    if self._last_map_pos and \
+                            self.route_nav.near_stop(self._last_map_pos):
+                        self._begin_rest(now)
+                else:
+                    self._begin_rest(now)
+            else:
+                self._begin_rest(now)
+        return self._resting
+
+    def _start_session(self, now):
+        sch = self.cfg.get("schedule", {})
+        base = sch.get("duration_min", 60) * 60
+        self._sess_end = now + base + random.uniform(-180, 180)  # ±3分钟
+        self._grace_until = None
+        self.log(f"⏱ 本轮挂机约 {int((self._sess_end - now) // 60)} 分钟（随机±3分钟）", "info")
+
+    def _begin_rest(self, now):
+        sch = self.cfg.get("schedule", {})
+        lo, hi = sch.get("rest_lo_min", 5), sch.get("rest_hi_min", 10)
+        self._resting = True
+        self._rest_until = now + random.uniform(lo, hi) * 60
+        self._sess_end = None
+        self._grace_until = None
+        self.move.release_all()
+        self.log(f"😴 进入休息 {int((self._rest_until - now) // 60)} 分钟"
+                 f"（血蓝监控保持运行）", "warn")
+
     def _attack(self):
         keys = self.cfg["keys"]
         if not self.controller.cooldown_ok("atk", 0.22):
@@ -448,19 +577,51 @@ class BotEngine(threading.Thread):
         """自动采样小地图玩家黄点颜色"""
         return self.route_nav.auto_sample(frames)
 
+    def set_nav_base(self, img):
+        """GUI 录制/加载小地图底图后注入（导航面板背景）"""
+        self._nav_base = img
+
+    NAV_W = 176  # 导航面板显示宽度（预览右上角）
+
     def _draw_patrol(self, ann, player_map):
         x, y, w, h = self.route_nav.minimap
         if w <= 4:
             return
-        cv2.rectangle(ann, (x - 2, y - 2), (x + w + 2, y + h + 2), (255, 210, 80), 1)
-        route = self.route_nav.route  # 叠加路线标记
-        if route is not None:
-            roi = ann[y:y + h, x:x + w]
+        # ① 真实小地图只画 1px 细边框（不再叠加路线颜色，不遮挡）
+        cv2.rectangle(ann, (x - 2, y - 2), (x + w + 2, y + h + 2),
+                      (255, 210, 80), 1)
+        # ② 组装导航面板：小地图底图 + 路线颜色
+        base = self._nav_base
+        panel = base.copy() if (base is not None and base.shape[:2] == (h, w)) \
+            else np.full((h, w, 3), 24, np.uint8)
+        route = self.route_nav.route
+        if route is not None and route.shape[:2] == panel.shape[:2]:
             nz = route.max(axis=2) > 40
-            roi[nz] = route[nz]
-        if self.route_nav.laps:
-            cv2.putText(ann, f"LAP {self.route_nav.laps}", (x + 4, y + h + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 210, 80), 1, cv2.LINE_AA)
+            panel[nz] = route[nz]
+        # ③ 缩放贴到预览画面右上角（轻微半透明融合）
+        scale = self.NAV_W / max(1, w)
+        dw = self.NAV_W
+        dh = int(round(h * scale))
+        ah, aw = ann.shape[:2]
+        dh = min(dh, max(40, ah - 24))
+        disp = cv2.resize(panel, (dw, dh), interpolation=cv2.INTER_NEAREST)
+        px1, py1 = aw - dw - 10, 10
+        roi = ann[py1:py1 + dh, px1:px1 + dw]
+        ann[py1:py1 + dh, px1:px1 + dw] = cv2.addWeighted(roi, 0.2, disp, 0.95, 0)
+        cv2.rectangle(ann, (px1 - 1, py1 - 1), (px1 + dw, py1 + dh),
+                      (255, 210, 80), 1)
+        cv2.putText(ann, "NAV", (px1 + 4, py1 + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 210, 80), 1, cv2.LINE_AA)
+        # ④ 候选点（暗黄小圈，调试用）+ 玩家位置（绿十字）
+        for cx, cy in self.route_nav.debug_cands:
+            cv2.circle(ann, (int(px1 + cx * scale), int(py1 + cy * scale)),
+                       2, (0, 180, 255), 1)
         if player_map:
-            cv2.drawMarker(ann, (int(x + player_map[0]), int(y + player_map[1])),
-                           (80, 255, 120), cv2.MARKER_CROSS, 12, 2)
+            mx = int(px1 + player_map[0] * scale)
+            my = int(py1 + player_map[1] * scale)
+            cv2.drawMarker(ann, (mx, my), (80, 255, 120),
+                           cv2.MARKER_CROSS, 12, 2)
+            cv2.circle(ann, (mx, my), 4, (80, 255, 120), 1)
+        if self.route_nav.laps:
+            cv2.putText(ann, f"LAP {self.route_nav.laps}", (px1, py1 + dh + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 210, 80), 1, cv2.LINE_AA)

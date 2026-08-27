@@ -27,7 +27,7 @@ class App(tk.Tk):
     PREVIEW_W, PREVIEW_H = 760, 430
     KEY_ROWS = [
         ("普通攻击", "attack"), ("技能1", "skill1"), ("技能2", "skill2"), ("技能3", "skill3"),
-        ("红药", "hp_potion"), ("蓝药", "mp_potion"),
+        ("红药", "hp_potion"), ("蓝药", "mp_potion"), ("拾取", "pickup"),
         ("左移", "move_left"), ("右移", "move_right"), ("跳跃", "jump"),
         ("上(抓绳)", "up"), ("下(下绳)", "down"), ("传送(法师)", "teleport"),
     ]
@@ -218,34 +218,35 @@ class App(tk.Tk):
         # 地图包 & 颜色路线
         box, body = self._section(tab, "🗺 地图包 · 颜色路线（录制一次，处处复用）")
         box.pack(fill="x", padx=8, pady=(4, 8))
-        row = tk.Frame(body, bg=PANEL_2);
-        row.pack(fill="x")
-        self.maps_combo = ttk.Combobox(row, state="readonly", width=11)
+        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x")
+        self.maps_combo = ttk.Combobox(row, state="readonly", width=8)
         self.maps_combo.pack(side="left")
         NeoButton(row, "⟳", command=self.refresh_maps, bg=PANEL, fg=TEXT,
-                  padx=9).pack(side="left", padx=(4, 0))
-        NeoButton(row, "📦 加载", command=self.load_map_pack, padx=10).pack(side="left", padx=(4, 0))
-        NeoButton(row, "💾 存为地图包", command=self.save_map_pack,
-                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(4, 0))
-        NeoButton(row, "🗑", command=self.delete_map_pack, bg="#3a3f55",
-                  fg=TEXT, padx=9).pack(side="left", padx=(4, 0))
-        row2 = tk.Frame(body, bg=PANEL_2);
-        row2.pack(fill="x", pady=(6, 0))
-        NeoButton(row2, "🧭 校准小地图", command=self.calibrate_minimap).pack(side="left")
-        NeoButton(row2, "📷 录制小地图", command=self.record_minimap).pack(side="left", padx=(6, 0))
-        NeoButton(row2, "🎨 绘制颜色路线", command=self.paint_route,
-                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(6, 0))
-        row3 = tk.Frame(body, bg=PANEL_2);
-        row3.pack(fill="x", pady=(6, 0))
+                  padx=8, font=(FONT, 9)).pack(side="left", padx=(3, 0))
+        NeoButton(row, "加载", command=self.load_map_pack, padx=9,
+                  font=(FONT, 9)).pack(side="left", padx=(3, 0))
+        NeoButton(row, "保存", command=self.save_map_pack, padx=9,
+                  font=(FONT, 9), bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(3, 0))
+        NeoButton(row, "删", command=self.delete_map_pack, padx=9,
+                  font=(FONT, 9), bg="#3a3f55", fg=TEXT).pack(side="left", padx=(3, 0))
+        row2 = tk.Frame(body, bg=PANEL_2); row2.pack(fill="x", pady=(5, 0))
+        NeoButton(row2, "🧭 校准小地图", command=self.calibrate_minimap,
+                  padx=8, font=(FONT, 9)).pack(side="left")
+        NeoButton(row2, "📷 录制小地图", command=self.record_minimap,
+                  padx=8, font=(FONT, 9)).pack(side="left", padx=(4, 0))
+        row3 = tk.Frame(body, bg=PANEL_2); row3.pack(fill="x", pady=(5, 0))
+        NeoButton(row3, "🎨 绘制路线", command=self.paint_route, padx=8,
+                  font=(FONT, 9), bg="#2f6f4f", fg=TEXT).pack(side="left")
+        row4 = tk.Frame(body, bg=PANEL_2); row4.pack(fill="x", pady=(5, 0))
         self.patrol_var = tk.BooleanVar(
             value=self.cfg.get("patrol", {}).get("enabled", False))
-        tk.Checkbutton(row3, text="启用路线巡逻", variable=self.patrol_var,
+        tk.Checkbutton(row4, text="启用路线巡逻", variable=self.patrol_var,
                        bg=PANEL_2, fg=TEXT, selectcolor="#141722",
                        activebackground=PANEL_2, activeforeground=TEXT,
                        font=(FONT, 9),
                        command=lambda: self._toggle_patrol(self.patrol_var)).pack(side="left")
-        tk.Label(row3, text="（颜色即指令：红左走·蓝右走·橙左跳·灰上爬绳…）",
-                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(side="left", padx=(6, 0))
+        tk.Label(row4, text="（红左走·蓝右走·灰上爬绳，Shift画直线）",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(side="left", padx=(4, 0))
         self.patrol_label = tk.Label(body, text="", fg=TEXT_DIM, bg=PANEL_2,
                                      font=(FONT, 9))
         self.patrol_label.pack(anchor="w", pady=(4, 0))
@@ -266,14 +267,13 @@ class App(tk.Tk):
                            on_change=lambda v, k=key: self._set_key(k, v))
             ent.pack(side="left")
             self._key_entries[key] = ent
-        tk.Label(body, text="支持：字母 / 数字 / F1-F12 / 方向键 / ALT / SHIFT / INSERT / HOME 等",
+        tk.Label(body, text="点击输入框→按键绑定；Backspace 清空（技能默认空=不使用技能）",
                  fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def _build_param_tab(self, tab):
         box, body = self._section(tab, "🎚 识别与策略参数")
         box.pack(fill="x", padx=8, pady=8)
-
         def slider(label, frm, to, key, fmt="{:.0f}"):
             row = tk.Frame(body, bg=PANEL_2);
             row.pack(fill="x", pady=4)
@@ -287,11 +287,11 @@ class App(tk.Tk):
                                key, float(v)), vl.config(text=fmt.format(float(v)))))
             sc.pack(side="left", fill="x", expand=True, padx=(4, 8))
             sc.bind("<ButtonRelease-1>", lambda e: self.cfg_mgr.save())
-
         slider("匹配阈值", 0.50, 0.98, "match", "{:.2f}")
         slider("红药阈值%", 10, 90, "hp_potion")
         slider("蓝药阈值%", 10, 90, "mp_potion")
         slider("攻击距离px", 40, 400, "attack_range")
+        slider("技能范围px", 80, 500, "skill_range")
         slider("喝药冷却s", 0.5, 5, "potion_cooldown", "{:.1f}")
         slider("巡逻换向s", 1, 8, "roam_interval", "{:.1f}")
 
@@ -300,7 +300,8 @@ class App(tk.Tk):
         for key, label in [("use_skill_rotation", "技能轮换输出（攻击/技能循环）"),
                            ("jump_while_roam", "巡逻时随机跳跃"),
                            ("stop_on_low_hp", "血量过低自动停机保护"),
-                           ("pause_on_unfocus", "游戏失焦时暂停按键（推荐开启）")]:
+                           ("pause_on_unfocus", "游戏失焦时暂停按键（推荐开启）"),
+                           ("loot_enabled", "边走边自动拾取（需配置拾取按键）"),]:
             var = tk.BooleanVar(value=self.cfg["options"].get(key, False))
             tk.Checkbutton(body2, text=label, variable=var, bg=PANEL_2, fg=TEXT,
                            selectcolor="#141722", activebackground=PANEL_2,
@@ -310,7 +311,6 @@ class App(tk.Tk):
 
         box3, body3 = self._section(tab, "🗺 巡逻微调")
         box3.pack(fill="x", padx=8, pady=(0, 8))
-
         def pslider(label, frm, to, key, default, fmt="{:.0f}"):
             p = self.cfg.setdefault("patrol", {})
             row = tk.Frame(body3, bg=PANEL_2);
@@ -326,9 +326,35 @@ class App(tk.Tk):
             sc.pack(side="left", fill="x", expand=True, padx=(4, 8))
             sc.bind("<ButtonRelease-1>", lambda e: (self.cfg_mgr.save(),
                                                     self.engine.reload_runtime()))
-
         pslider("搜索半径", 4, 25, "search_range", 10)
         pslider("抓绳容差", 2, 10, "grab_tol", 4)
+        pslider("玩家点面积", 12, 120, "dot_max_area", 40)
+
+        box4, body4 = self._section(tab, "⏱ 挂机时长（到点休息，自动循环）")
+        box4.pack(fill="x", padx=8, pady=(0, 8))
+        sch = self.cfg.setdefault("schedule", {})
+        svar = tk.BooleanVar(value=sch.get("enabled", False))
+        tk.Checkbutton(body4, text="启用定时休息（实际时长随机 ±3 分钟）", variable=svar,
+                       bg=PANEL_2, fg=TEXT, selectcolor="#141722",
+                       activebackground=PANEL_2, activeforeground=TEXT,
+                       font=(FONT, 9), anchor="w",
+                       command=lambda: (sch.__setitem__("enabled", svar.get()),
+                                        self.cfg_mgr.save())).pack(anchor="w")
+        row = tk.Frame(body4, bg=PANEL_2);
+        row.pack(fill="x", pady=3)
+        tk.Label(row, text="挂机时长", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=9, anchor="w").pack(side="left")
+        vl = tk.Label(row, text=f"{sch.get('duration_min', 60)}分", bg=PANEL_2,
+                      fg=ACCENT, font=(MONO, 9, "bold"), width=7)
+        vl.pack(side="right")
+        sc = ttk.Scale(row, from_=15, to=240, value=sch.get("duration_min", 60),
+                       command=lambda v: (sch.__setitem__("duration_min", int(float(v))),
+                                          vl.config(text=f"{int(float(v))}分")))
+        sc.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        sc.bind("<ButtonRelease-1>", lambda e: self.cfg_mgr.save())
+        tk.Label(body4, text="到点后走到路线上的停止标记(浅绿)休息 5-10 分钟再继续；"
+                             "无停止标记则原地休息。休息期间血蓝监控照常运行",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(2, 0))
 
     # ---------- 右侧：预览 + 状态 + 日志 ----------
     def _build_right(self, right):
@@ -588,6 +614,7 @@ class App(tk.Tk):
         if self._route_img is not None and \
                 self._route_img.shape != self._minimap_snap.shape:
             self._route_img = None  # 尺寸变了，旧路线作废
+        self.engine.set_nav_base(self._minimap_snap)
         self.log(f"小地图底图已录制 ({mm['w']}×{mm['h']})，可「绘制颜色路线」", "ok")
 
     def paint_route(self):
@@ -608,6 +635,8 @@ class App(tk.Tk):
                 self.cfg.setdefault("patrol", {})["route_path"] = rp
                 self.cfg_mgr.save()
                 self.engine.load_route(route_img, path_tag=rp)
+                if self._minimap_snap is not None:
+                    self.engine.set_nav_base(self._minimap_snap)
                 self.log(f"路线已保存到地图包「{name}」", "ok")
             else:
                 self.engine.load_route(route_img)
@@ -661,6 +690,8 @@ class App(tk.Tk):
             return
         self._minimap_snap = self.maps.load_minimap(name)
         self._route_img = self.maps.load_route(name)
+        if self._minimap_snap is not None:
+            self.engine.set_nav_base(self._minimap_snap)
         self.cfg_mgr.save()
         self.engine.reload_runtime()
         # 同步 UI 控件
@@ -721,10 +752,10 @@ class App(tk.Tk):
         self.log("检测区域已恢复全屏", "info")
 
     def _set_key(self, key, value):
-        if value and value != "-":
-            self.cfg["keys"][key] = value
-            self.cfg_mgr.save()
-            self.log(f"按键 [{key}] → {value}", "info")
+        v = "" if (not value or value == "-") else value
+        self.cfg["keys"][key] = v
+        self.cfg_mgr.save()
+        self.log(f"按键 [{key}] → {v or '(空)'}", "info")
 
     def start_bot(self, _e=None):
         if not self.engine.window_bound():
