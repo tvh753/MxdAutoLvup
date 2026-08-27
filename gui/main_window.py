@@ -787,14 +787,20 @@ class App(tk.Tk):
     def delete_map_pack(self):
         name = self.maps_combo.get()
         if not name or not messagebox.askyesno(
-                "删除确认", f"确定删除地图包「{name}」？", parent=self):
+                "删除确认", f"确定删除地图包「{name}」？\n（包内绑定的怪物模板一并删除）",
+                parent=self):
             return
         self.maps.delete(name)
         if self.cfg.get("patrol", {}).get("current_map") == name:
             self.cfg["patrol"]["current_map"] = ""
             self.cfg["patrol"]["route_path"] = ""
+            self.cfg["monster_templates"] = []  # 绑定的怪物一并解绑
+            self._minimap_snap = None
+            self._route_img = None
             self.cfg_mgr.save()
+            self.engine.clear_route()
             self.engine.reload_runtime()
+            self.refresh_tpl_list()
         self.refresh_maps()
         self.refresh_patrol_label()
         self.log(f"地图包「{name}」已删除", "warn")
