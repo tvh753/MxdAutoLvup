@@ -735,26 +735,33 @@ class App(tk.Tk):
 
     def load_map_pack(self):
         name = self.maps_combo.get()
-        self.engine.invalidate_route_cache()
-        ok, missing = self.maps.load(name, self.cfg)
-        if not ok:
-            messagebox.showerror("错误", "地图包加载失败（profile.json 缺失）", parent=self)
-            return
-        if missing:
-            self.log(f"⚠ 地图包「{name}」缺失文件：{', '.join(missing)}，请重新录制对应内容", "warn")
         if not name:
             messagebox.showwarning("提示", "请先选择地图包", parent=self)
             return
         self.engine.invalidate_route_cache()
-        if not self.maps.load(name, self.cfg):
-            messagebox.showerror("错误", "地图包加载失败（profile.json 缺失）", parent=self)
+        ok, missing = self.maps.load(name, self.cfg)
+        if not ok:
+            messagebox.showerror("错误", "地图包加载失败（profile.json 缺失）",
+                                 parent=self)
             return
         self._minimap_snap = self.maps.load_minimap(name)
         self._route_img = self.maps.load_route(name)
-        if self._minimap_snap is not None:
-            self.engine.set_nav_base(self._minimap_snap)
+        # 自愈：底图缺失 → 窗口已绑定且 ROI 有效则现场补拍写回包
+        if self._minimap_snap is None:
+            mm = self.cfg.get("patrol", {}).get("minimap", {})
+            frame = self._grab_frame() if mm.get("w", 0) > 4 else None
+            if frame is not None:
+                self._minimap_snap = frame[mm["y"]:mm["y"] + mm["h"],
+                                     mm["x"]:mm["x"] + mm["w"]].copy()
+                self.maps.save_minimap(name, self._minimap_snap)
+                self.log("小地图底图缺失，已现场自动补拍并写入地图包", "ok")
+            else:
+                self.log("底图缺失且无法自动补拍（未绑定窗口？），请绑定后"
+                         "点「📷 录制小地图」再「💾 保存」", "warn")
         self.cfg_mgr.save()
         self.engine.reload_runtime()
+        if self._minimap_snap is not None:
+            self.engine.set_nav_base(self._minimap_snap)
         # 同步 UI 控件
         for k, ent in self._key_entries.items():
             ent.var.set(self.cfg["keys"].get(k, "-"))
@@ -762,10 +769,13 @@ class App(tk.Tk):
         self.refresh_tpl_list()
         self.refresh_maps()
         self.refresh_patrol_label()
-        self.log(f"📦 地图包「{name}」已加载：怪物模板 "
-                 f"{len(self.cfg['monster_templates'])} 个 · "
-                 f"路线 {'✓' if self._route_img is not None else '✗'} · "
-                 f"血条/按键配置已恢复", "ok")
+        self.log(f"📦 地图包「{name}」已加载：绑定怪物 "
+                 f"{len(self.cfg.get('monster_templates', []))} 个 · "
+                 f"底图{'✓' if self._minimap_snap is not None else '✗'} · "
+                 f"路线{'✓' if self._route_img is not None else '✗'} · "
+                 f"玩家模板{'✓' if self.cfg.get('player_template') else '✗'}", "ok")
+        if self._route_img is None:
+            self.log("路线图缺失：请「🎨 绘制路线」，画完自动存入本地图包", "warn")
         # 自动绑定窗口
         wt = self.cfg.get("window_title", "")
         if wt and not self.engine.window_bound():
