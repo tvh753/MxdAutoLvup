@@ -59,6 +59,8 @@ class BotEngine(threading.Thread):
         self.rope_det = RopeDetector()  # 主画面绳子识别（精调对位）
         self._rope_t = 0.0
         self._route_path_loaded = None
+        self._offroute_log_t = 0.0
+        self.route_nav.on_log = self.log  # 导航器诊断日志 → 控制台日志
         self._nav_base = None
 
         self.mode = Mode.IDLE
@@ -136,38 +138,40 @@ class BotEngine(threading.Thread):
             grab_tol=p.get("grab_tol", 4),
             dot_max_area=p.get("dot_max_area", 40),
         )
+
         rp = p.get("route_path", "")
         if rp and rp != self._route_path_loaded:
             img = imread_u(rp)
             if img is None:
                 self.log(f"路线图不存在或读取失败: {rp}（重新绘制并保存路线可修复）", "warn")
                 self._nav_base = None
-            elif img.shape[0] == mm.get("h", 0) and img.shape[1] == mm.get("w", 0):
+            else:
+                mw, mh = mm.get("w", 0), mm.get("h", 0)
+                if mw > 4 and (img.shape[1], img.shape[0]) != (mw, mh):
+                    ow, oh = img.shape[1], img.shape[0]
+                    img = cv2.resize(img, (mw, mh), interpolation=cv2.INTER_NEAREST)
+                    self.log(f"路线图尺寸({ow}x{oh})与小地图({mw}x{mh})不符，"
+                             f"已自动缩放适配；若路线错位请重绘", "warn")
                 self.route_nav.load(img)
                 self._route_path_loaded = rp
                 base = imread_u(os.path.join(os.path.dirname(rp), "minimap.png"))
                 self._nav_base = base if (base is not None and
                                           base.shape[:2] == img.shape[:2]) else None
                 self.log(f"颜色路线已加载：{os.path.basename(os.path.dirname(rp))}"
-                         + ("" if self._nav_base is not None
-                            else "（无小地图底图，导航面板用暗底）"))
-            else:
-                self.log("路线图尺寸与小地图区域不符，请重录小地图并重画路线", "warn")
-                self._nav_base = None
+                         + ("" if self._nav_base is not None else "（无小地图底图）"))
         self.move.bind(self.cfg["keys"])
 
-
     def load_route(self, route_bgr, path_tag="memory"):
-        """GUI 绘制/加载路线后直接喂入；path_tag 用于缓存判断"""
         if route_bgr is None:
             return
         mm = self.cfg.get("patrol", {}).get("minimap", {})
-        if route_bgr.shape[0] == mm.get("h", 0) and \
-                route_bgr.shape[1] == mm.get("w", 0):
-            self.route_nav.load(route_bgr)
-            self._route_path_loaded = path_tag
-        else:
-            self.log("路线图尺寸与小地图区域不符", "warn")
+        mw, mh = mm.get("w", 0), mm.get("h", 0)
+        if mw > 4 and (route_bgr.shape[1], route_bgr.shape[0]) != (mw, mh):
+            route_bgr = cv2.resize(route_bgr, (mw, mh),
+                                   interpolation=cv2.INTER_NEAREST)
+            self.log("路线图与小地图尺寸不一致，已自动缩放适配（若错位请重绘）", "warn")
+        self.route_nav.load(route_bgr)
+        self._route_path_loaded = path_tag
 
     def invalidate_route_cache(self):
         """切换地图包前调用，强制 reload 重新读文件"""
@@ -350,22 +354,44 @@ class BotEngine(threading.Thread):
         keys, th = self.cfg["keys"], self.cfg["thresholds"]
         patrol = self.cfg.get("patrol", {})
         now = time.time()
+        patrol_on = patrol.get("enabled") and self.route_nav.ready
         # 战斗刚结束 → 立即触发拾取
         if self._was_combat and not monsters:
             self._loot_t = 0.0
         self._was_combat = bool(monsters)
-        # ---------- ① 战斗优先 ----------
-        if monsters and (self._giveup_until is None or now > self._giveup_until):
-            if self._chase_t0 is None:
-                self._chase_t0 = now
-            if now - self._chase_t0 > patrol.get("max_chase_time", 8.0):
-                self._giveup_until = now + 5.0
+        anchor = player if player is not None else \
+            (frame.shape[1] // 2, frame.shape[0] // 2, 1.0, 0, 0)
+        ax = anchor[0]
+        # ---------- ① 战斗（巡逻模式限距追击，防脱线） ----------
+        can_fight = (self._giveup_until is None or now > self._giveup_until)
+        # 偏离路线检测：玩家点离最近标记太远 → 放弃战斗，2 秒防抖
+        if can_fight and patrol_on and player_map is not None:
+            off = self.route_nav.off_route_distance(player_map)
+            if off > th.get("off_route_tol", 30):
+                can_fight = False
                 self._chase_t0 = None
-                self.move.release_all()
-                self.log("追击超时，暂离怪物 5 秒，回归巡逻路线", "warn")
-            else:
-                return self._combat(frame, monsters, player, now)
-        else:
+                self._giveup_until = now + 2.0
+                if now - self._offroute_log_t > 8:
+                    self._offroute_log_t = now
+                    self.log(f"已偏离路线 {off:.0f}px，放弃追击回归路线", "info")
+        fought = False
+        if monsters and can_fight:
+            # 追击距离：巡逻时只追屏幕距离内的怪（远处怪不追，继续走线）
+            near = [m for m in monsters
+                    if abs(m[0][0] - ax) <= th.get("chase_range", 220)] \
+                if patrol_on else monsters
+            if near:
+                fought = True
+                if self._chase_t0 is None:
+                    self._chase_t0 = now
+                if now - self._chase_t0 > patrol.get("max_chase_time", 4.0):
+                    self._giveup_until = now + 5.0
+                    self._chase_t0 = None
+                    self.move.release_all()
+                    self.log("追击超时，暂离怪物 5 秒，回归巡逻路线", "warn")
+                else:
+                    return self._combat(frame, near, player, now)
+        if not fought:
             self._chase_t0 = None
             if self._giveup_until and now > self._giveup_until:
                 self._giveup_until = None
@@ -374,23 +400,22 @@ class BotEngine(threading.Thread):
             cmd = self.route_nav.step(player_map, now)
             if cmd.stop:
                 self.move.release_all()
-                self._try_loot(now)
                 return cmd.status
             if self.route_nav.phase in ("align", "grab"):
                 self._rope_assist(frame, cmd, now)
             self.move.set_dir(cmd.dir)
             self.move.set_climb(cmd.climb)
             if cmd.jump:
-                if cmd.vdir:  # 下跳：按住↓+跳
+                if cmd.vdir:
                     self.controller.combo(keys.get("jump"), keys.get(cmd.vdir))
                 else:
                     self.controller.tap(keys.get("jump"))
-            if cmd.teleport:  # 瞬移：方向+传送键
+            if cmd.teleport:
                 dkey = {"up": keys.get("up"), "down": keys.get("down"),
                         "left": keys.get("move_left"),
                         "right": keys.get("move_right")}.get(cmd.teleport)
                 self.controller.combo(keys.get("teleport"), dkey, hold=0.25)
-            if self.route_nav.phase == "none":  # 边走边拾取 + 脱困
+            if self.route_nav.phase == "none":  # 仅普通走位时：拾取 + 脱困
                 self._try_loot(now)
                 stuck = self.route_nav.stuck_seconds()
                 if stuck > 3.0 and self.controller.cooldown_ok("unstuck", 2.5):

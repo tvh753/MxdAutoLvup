@@ -28,7 +28,10 @@ DEFAULT_CONFIG = {
     "thresholds": {
         "match": 0.80, "hp_potion": 55, "mp_potion": 35, "hp_stop": 12,
         "attack_range": 160, "potion_cooldown": 1.2, "roam_interval": 2.5,
-        "skill_range": 260, "pickup_interval": 0.9
+        "skill_range": 260,
+	    "chase_range": 220,        # 追击距离：怪物屏幕像素距离上限（巡逻时）
+        "off_route_tol": 30,       # 偏离容差：小地图px，超出即放弃追击回归路线
+        "pickup_interval": 0.3,    # 拾取间隔：移动中边走边捡（原 0.9）
     },
     "options": {
         "use_skill_rotation": True, "jump_while_roam": True,

@@ -4,22 +4,20 @@
 # @File    : color_route.py
 # @Software: MxdAutoLvup
 
-# -*- coding: utf-8 -*-
-"""小地图颜色路径导航 v4 —— 玩家点检测重构版
-v4 修复「玩家恒在地图中央」：
-  旧版 BGR 距离匹配黄点 → 小地图米黄底色/黄褐平台线同被命中
-  → 整块底色连成巨大连通域 → 质心≈地图几何中心 → 位置恒为中央。
-  新管线：
-    ① HSV 高饱和亮黄(S≥90, V≥140, 色相=采样色±8)   滤除低饱和米黄底色
-    ② 连通域面积(2~dot_max_area)+边长(≤8)双过滤      滤除平台黄线/图标
-    ③ 初始捕获：12帧闪烁判别（玩家点闪烁 0.15~0.85 出现率；NPC 常亮≈1.0）
-    ④ 锁定后：最近邻追踪 + 累积掩码兜底 + 末位位置兜底(1.5s)
+"""小地图颜色路径导航 v5
+v5 变更：
+  ① 追击防脱线配套：off_route_distance() 玩家点离最近标记距离
+  ② 玩家点定位放宽+兜底：闪烁率上限 0.85→0.92；无闪烁簇时唯一常亮候选
+     兜底锁定；持续无候选 → 诊断日志（on_log 回调注入引擎日志）
+  ③ 爬绳时序修正：到位先停步 0.15s → 原地跳+↑ 抓绳（旧版带着横移速度
+     起跳容易冲过绳子）；抓绳失败 backoff 退开重试
+  ④ 检测阈值放宽：S≥80 / V≥120，色相区间 ±10
 """
 import time
 import cv2
 import numpy as np
 
-DEFAULT_DOT_COLOR = (60, 230, 255)  # BGR 玩家黄点
+DEFAULT_DOT_COLOR = (60, 230, 255)
 BLINK_FRAMES = 12
 MOVE_EPS = 1.5
 NEAREST_TOL = 100
@@ -57,8 +55,8 @@ class RouteCmd:
 
 
 class ColorRouteNavigator:
-    DOT_S_MIN = 90  # 玩家点最低饱和度（米黄底色 S≈40，被滤除）
-    DOT_V_MIN = 140  # 玩家点最低亮度
+    DOT_S_MIN = 80  # 玩家点最低饱和度（米黄底色 S≈40，被滤除）
+    DOT_V_MIN = 120  # 玩家点最低亮度
     DOT_SIDE = 8  # 玩家点最大边长（滤掉平台黄线等长条）
 
     def __init__(self):
@@ -66,13 +64,16 @@ class ColorRouteNavigator:
         self.minimap = (0, 0, 0, 0)
         self.dot_color = np.array(DEFAULT_DOT_COLOR, np.int16)
         self.tolerance = 80
-        self.dot_max_area = 40  # 玩家点面积上限 px²
+        self.dot_max_area = 40
         self.search_range = 10
         self.grab_tol = 4
+        # ---- 日志回调（引擎注入） ----
+        self.on_log = None
         # ---- 路线 ----
         self.route = None
         self._label = None
         self._codes = []
+        self._marks_xy = None  # 标记点坐标数组（off_route 距离计算）
         self.laps = 0
         self._stop_idx = -1
         self._has_stop = False
@@ -80,20 +81,24 @@ class ColorRouteNavigator:
         self._masks = []
         self._last_pos = None
         self._move_t = time.time()
-        self._dot_seen_t = -99.0  # 最后成功检测玩家点的时刻
-        self._acq = None  # 初始捕获帧缓存
+        self._dot_seen_t = -99.0
+        self._acq = None
         self._h_lo, self._h_hi = 20, 33
-        self.debug_cands = []  # 调试：当前帧候选点（预览面板绘制用）
+        self._no_cand_t = 0.0
+        self._no_cand_log_t = -99.0
+        self.debug_cands = []
         # ---- 爬绳状态机 ----
         self._phase = "none"
         self._t0 = 0.0
         self._y0 = None
         self._retries = 0
+        self._grab_jumped = False
+        self._backoff_dir = 1
         # ---- 动作冷却 ----
         self._jump_t = 0.0
         self._tp_t = 0.0
         self._goal_t = 0.0
-        # v3 跟随运行时
+        # ---- 跟随运行时 ----
         self._cur_dir = 0
         self._last_mark = None
         self._last_seen_t = -99.0
@@ -118,10 +123,13 @@ class ColorRouteNavigator:
             self.dot_max_area = max(8, int(dot_max_area))
 
     def _update_hue(self):
-        """由采样点色计算检测色相区间（±8）"""
         px = np.array(self.dot_color, np.uint8).reshape(1, 1, 3)
         h = int(cv2.cvtColor(px, cv2.COLOR_BGR2HSV)[0, 0, 0])
-        self._h_lo, self._h_hi = max(0, h - 8), min(179, h + 8)
+        self._h_lo, self._h_hi = max(0, h - 10), min(179, h + 10)
+
+    def _log(self, msg, level="warn"):
+        if self.on_log:
+            self.on_log(msg, level)
 
     @property
     def ready(self):
@@ -151,6 +159,14 @@ class ColorRouteNavigator:
         hit = bestd < NEAREST_TOL
         lab[hit] = best[hit].astype(np.int8)
         self._label = lab
+        # 预存标记点（下采样控制数量），供 off_route_distance 使用
+        ys, xs = np.nonzero(lab >= 0)
+        if len(xs):
+            step = max(1, len(xs) // 2000)
+            self._marks_xy = np.stack([xs[::step], ys[::step]],
+                                      1).astype(np.float32)
+        else:
+            self._marks_xy = None
         self._codes = [(hh, v, act, nm) for (_, hh, v, act, nm) in RAW_CODES]
         for i, entry in enumerate(RAW_CODES):
             if entry[3] == "stop":
@@ -161,12 +177,13 @@ class ColorRouteNavigator:
         self._consumed.clear()
         self._cur_dir = 0
         self._last_mark = None
-        self._last_pos = None  # 换路线 → 重新捕获玩家
+        self._last_pos = None
         self._acq = None
         self._reset_climb()
 
     def _reset_climb(self):
         self._phase, self._t0, self._y0, self._retries = "none", 0.0, None, 0
+        self._grab_jumped = False
 
     def back_to_align(self):
         if self._phase in ("grab", "climb"):
@@ -180,7 +197,7 @@ class ColorRouteNavigator:
     def stuck_seconds(self):
         return max(0.0, time.time() - self._move_t) if self._last_pos is not None else 0.0
 
-    # ================= 玩家定位（v4 重构） =================
+    # ================= 玩家定位 =================
     def player_pos(self, frame_bgr):
         x, y, w, h = self.minimap
         if w <= 4 or h <= 4 or frame_bgr is None:
@@ -193,17 +210,25 @@ class ColorRouteNavigator:
         now = time.time()
         cands, mask = self._dot_candidates(roi)
         self.debug_cands = [(c[0], c[1]) for c in cands]
+        # 无候选诊断（定位失败的直接原因反馈）
+        if not cands:
+            if self._no_cand_t == 0.0:
+                self._no_cand_t = now
+            elif now - self._no_cand_t > 3.0 and now - self._no_cand_log_t > 15.0:
+                self._no_cand_log_t = now
+                self._log("小地图内未检出玩家黄点：请重新「校准小地图」（会重新采样玩家点颜色），"
+                          "或调大参数页「玩家点面积」", "warn")
+        else:
+            self._no_cand_t = 0.0
         self._masks.append(mask)
         if len(self._masks) > BLINK_FRAMES:
             self._masks.pop(0)
         # —— 已锁定：最近邻追踪 ——
         if self._last_pos is not None:
             if cands:
-                pos = self._pick(cands)
                 self._dot_seen_t = now
-                return pos
-            # 闪烁熄灭帧：累积掩码兜底（放宽面积，容忍移动拖尾）
-            if self._masks:
+                return self._pick(cands)
+            if self._masks:  # 闪烁熄灭帧：累积掩码兜底
                 acc = np.maximum.reduce(self._masks)
                 pos = self._pick(self._cc_filter(acc, 2, self.dot_max_area * 3,
                                                  side=10 ** 6))
@@ -218,11 +243,11 @@ class ColorRouteNavigator:
         pos = self._acquire(cands, now)
         if pos is not None:
             self._dot_seen_t = now
+            self._last_pos = pos
+            self._log(f"🧭 玩家点已锁定 ({pos[0]:.0f},{pos[1]:.0f})，开始路线导航", "ok")
         return pos
 
     def _dot_candidates(self, roi):
-        """小而紧凑的高饱和亮黄斑点（玩家/NPC 点）。
-        米黄底色被 S 阈值滤除；平台黄线被面积/边长滤除。"""
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, (self._h_lo, self.DOT_S_MIN, self.DOT_V_MIN),
                            (self._h_hi, 255, 255))
@@ -253,8 +278,8 @@ class ColorRouteNavigator:
         return min(cands, key=lambda c: (c[0] - lx) ** 2 + (c[1] - ly) ** 2)[:2]
 
     def _acquire(self, cands, now):
-        """初始捕获：玩家点闪烁（出现率 0.15~0.85）、NPC 常亮（≈1.0）。
-        12 帧窗口内按位置聚类统计出现率，优先选闪烁簇。"""
+        """初始捕获：优先闪烁簇（玩家点闪烁率 0.15~0.92，NPC 常亮≈1.0）；
+        无闪烁簇时，仅存在唯一常亮候选则兜底锁定（无 NPC 地图场景）"""
         if self._acq is None or now - self._acq["t0"] > 2.5:
             self._acq = {"t0": now, "frames": []}
         self._acq["frames"].append(cands)
@@ -275,24 +300,25 @@ class ColorRouteNavigator:
                 e[2] += 1;
                 e[3] += a
         total = len(frames)
-        best, best_score = None, -1.0
+        blink, steady = [], []
         for (_, _), (sx, sy, cnt, sa) in pts.items():
             ratio = cnt / total
-            if 0.15 <= ratio <= 0.85:  # 闪烁 → 玩家
-                score = 2.0 + min(sa / max(1, cnt), 40) / 100
-            elif ratio > 0.85:  # 常亮 → 疑似 NPC
-                score = 0.5
-            else:
-                score = 0.0
-            if score > best_score:
-                best_score = score
-                best = (sx / cnt, sy / cnt)
+            pos = (sx / cnt, sy / cnt, sa / max(1, cnt))
+            if 0.15 <= ratio <= 0.92:
+                blink.append(pos)
+            elif ratio > 0.92:
+                steady.append(pos)
         self._acq = None
-        return best
+        if blink:
+            best = max(blink, key=lambda p: p[2])  # 面积最大的闪烁簇
+            return (best[0], best[1])
+        if len(steady) == 1:  # 唯一常亮 → 兜底锁定
+            self._log("玩家点定位：无闪烁簇，采用唯一常亮候选兜底锁定"
+                      "（若位置有误请重新校准小地图）", "warn")
+            return (steady[0][0], steady[0][1])
+        return None
 
     def auto_sample(self, frames):
-        """多帧采样玩家黄点颜色：只取小而紧凑的高饱和亮黄斑块像素中位色
-        （旧版对整个 ROI 取黄色像素中位色，可能混入平台线颜色）"""
         x, y, w, h = self.minimap
         if w <= 4 or not frames:
             return None
@@ -319,6 +345,14 @@ class ColorRouteNavigator:
         self.dot_color = np.array(med, dtype=np.int16)
         self._update_hue()
         return med.tolist()
+
+    # ================= 偏离检测（追击限距配套） =================
+    def off_route_distance(self, pos):
+        """玩家点离最近路线标记的距离（小地图px）；无路线返回 0"""
+        if self._marks_xy is None or pos is None:
+            return 0.0
+        p = np.array([pos[0], pos[1]], np.float32)
+        return float(np.sqrt(((self._marks_xy - p) ** 2).sum(1)).min())
 
     # ================= 停止标记（休息安全点） =================
     def near_stop(self, pos, tol=8):
@@ -383,13 +417,12 @@ class ColorRouteNavigator:
                  int(xs[i] + x0), int(ys[i] + y0)) for i in order]
 
     def _choose(self, cands, x, now):
-        """方向迟滞选择：身后标记按距离加重惩罚；已消费的跳跃/传送标记跳过"""
         if len(self._consumed) > 400:
             self._consumed = {k: t for k, t in self._consumed.items() if t > now}
         active, consumed = [], []
         for c in cands:
             d, idx, mx, my = c
-            hh, v, act, nm = self._codes[idx]
+            act = self._codes[idx][2]
             if act in CONSUMABLE and \
                     self._consumed.get((idx, mx // 5, my // 5), 0) > now:
                 consumed.append(c)
@@ -449,6 +482,7 @@ class ColorRouteNavigator:
         return cmd
 
     def _climb(self, way, x, y, mx, now, nm):
+        # —— 攀爬中：y 持续变化则按住，停滞超时交给下一标记 ——
         if self._phase == "climb":
             if now - self._move_t < 0.6:
                 self._t0 = now
@@ -457,6 +491,13 @@ class ColorRouteNavigator:
                 self._reset_climb()
                 return RouteCmd(status="🪢 攀爬结束")
             return RouteCmd(climb=way, status=f"🪢 攀爬中[{nm}]")
+        # —— 退避重试：反向走开 0.3s 再回来重新对位 ——
+        if self._phase == "backoff":
+            if now - self._t0 >= 0.3:
+                self._phase = "align"
+                return RouteCmd(dir=0, status="🪢 重新对位")
+            return RouteCmd(dir=self._backoff_dir, status="🪢 退开重试")
+        # —— 抓绳确认：y 变化 ≥2 = 已上绳 ——
         if self._phase == "grab":
             if self._y0 is not None and abs(y - self._y0) >= 2:
                 self._phase, self._t0 = "climb", now
@@ -466,14 +507,22 @@ class ColorRouteNavigator:
                 if self._retries >= 4:
                     self._reset_climb()
                     return RouteCmd(status="⚠ 抓绳多次失败，暂停该动作")
-                self._phase = "align"
-                return RouteCmd(status="🪢 未抓住绳，重新对位")
-            return RouteCmd(climb=way, status="🪢 抓绳中…")
+                self._backoff_dir = 1 if self._retries % 2 else -1
+                self._phase, self._t0 = "backoff", now
+                return RouteCmd(dir=0, status="🪢 抓绳未果，退开重试")
+            # 停稳 0.15s 后原地起跳抓绳（只跳一次）；下绳则直接按住↓挂绳
+            if way == "up":
+                if not self._grab_jumped and now - self._t0 >= 0.15:
+                    self._grab_jumped = True
+                    return RouteCmd(dir=0, climb="up", jump=True,
+                                    status="🦘+🪢 原地跳抓绳")
+                return RouteCmd(dir=0, climb="up", status="🪢 抓绳中…")
+            return RouteCmd(dir=0, climb="down", status="🪢 挂绳下滑")
+        # —— 对准绳子 x ——
         if abs(x - mx) > self.grab_tol:
             self._phase = "align"
             return RouteCmd(dir=1 if mx > x else -1,
                             status=f"🪢 对准绳子…[{nm}]")
-        self._phase, self._t0, self._y0 = "grab", now, y
-        if way == "up":
-            return RouteCmd(jump=True, climb="up", status="🦘+🪢 跳跃抓绳")
-        return RouteCmd(climb="down", status="🪢 挂绳下滑")
+        # —— 到位：先停步再抓（带横移速度起跳容易冲过绳子） ——
+        self._phase, self._t0, self._y0, self._grab_jumped = "grab", now, y, False
+        return RouteCmd(dir=0, status="🪢 停步准备抓绳")

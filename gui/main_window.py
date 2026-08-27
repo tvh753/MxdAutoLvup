@@ -292,6 +292,9 @@ class App(tk.Tk):
         slider("蓝药阈值%", 10, 90, "mp_potion")
         slider("攻击距离px", 40, 400, "attack_range")
         slider("技能范围px", 80, 500, "skill_range")
+        slider("追击距离px", 60, 500, "chase_range")
+        slider("偏离容差px", 10, 60, "off_route_tol")
+        slider("拾取间隔s", 0.1, 1.5, "pickup_interval")
         slider("喝药冷却s", 0.5, 5, "potion_cooldown", "{:.1f}")
         slider("巡逻换向s", 1, 8, "roam_interval", "{:.1f}")
 
@@ -329,6 +332,7 @@ class App(tk.Tk):
         pslider("搜索半径", 4, 25, "search_range", 10)
         pslider("抓绳容差", 2, 10, "grab_tol", 4)
         pslider("玩家点面积", 12, 120, "dot_max_area", 40)
+        pslider("追击时限s", 1.0, 10.0, "max_chase_time", 4.0, "{:.1f}")
 
         box4, body4 = self._section(tab, "⏱ 挂机时长（到点休息，自动循环）")
         box4.pack(fill="x", padx=8, pady=(0, 8))
