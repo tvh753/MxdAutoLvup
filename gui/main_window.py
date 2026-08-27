@@ -653,8 +653,15 @@ class App(tk.Tk):
         if self._route_img is not None and \
                 self._route_img.shape != self._minimap_snap.shape:
             self._route_img = None  # 尺寸变了，旧路线作废
+
         self.engine.set_nav_base(self._minimap_snap)
-        self.log(f"小地图底图已录制 ({mm['w']}×{mm['h']})，可「绘制颜色路线」", "ok")
+        pack = self._active_pack()
+        if pack:
+            self.maps.save_minimap(pack, self._minimap_snap)
+            self.log(f"小地图底图已录制并写入地图包「{pack}」"
+                     f"({mm['w']}×{mm['h']})", "ok")
+        else:
+            self.log(f"小地图底图已录制 ({mm['w']}×{mm['h']})，可「绘制颜色路线」", "ok")
 
     def paint_route(self):
         if self._minimap_snap is None:  # 尝试从当前地图包取底图
