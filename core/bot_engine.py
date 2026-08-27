@@ -21,6 +21,7 @@ from core.action_controller import ActionController, MovementController
 from core.color_route import ColorRouteNavigator
 from core.rope_detector import RopeDetector
 from core.imio import imread_u
+from core.config_manager import PLAYER_TPL_PATH, resolve_player_path
 
 
 class Mode:
@@ -112,12 +113,30 @@ class BotEngine(threading.Thread):
                 self.detector.load(item["name"], item["path"])
             except Exception as e:
                 self.log(f"模板加载失败 [{item.get('name')}]: {e}", "warn")
+
+        # ---- 玩家模板（全局体系 + 路径归一化兜底） ----
+        from core.config_manager import PLAYER_TPL_PATH, resolve_player_path
         pt = self.cfg.get("player_template")
-        self._player_tpl = None
-        if pt and pt.get("path"):
+        tpl_path = resolve_player_path(pt.get("path")) if pt else None
+        if tpl_path is None:
+            # 路径无效：回退全局模板
+            if os.path.isfile(PLAYER_TPL_PATH):
+                tpl_path = PLAYER_TPL_PATH
+                self.cfg["player_template"] = {"name": "玩家", "path": tpl_path}
+                self.log("玩家模板路径已自动修正为全局模板", "info")
+            else:
+                self.cfg["player_template"] = None
+                self.log("玩家模板不可用（路径无效且无全局模板），已停用；"
+                         "重新「框选玩家模板」可恢复", "warn")
+        if tpl_path:
             try:
-                self.detector.load(pt["name"], pt["path"])
-                self._player_tpl = pt["name"]
+                self._player_tpl = None
+                if pt and pt.get("path"):
+                    try:
+                        self.detector.load(pt["name"], pt["path"])
+                        self._player_tpl = pt["name"]
+                    except Exception as e:
+                        self.log(f"玩家模板加载失败: {e}", "warn")
             except Exception as e:
                 self.log(f"玩家模板加载失败: {e}", "warn")
 
