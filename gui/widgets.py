@@ -158,18 +158,13 @@ class KeyEntry(tk.Entry):
             self.configure(fg="#7dd3fc", bg="#12203a")
         return "break"
 
-
     def _on_key(self, e):
         if not self._capturing:
             return "break"
         ks = e.keysym
-        if ks in ("BackSpace", "Delete"):  # ← 清空按键（设为空）
-            name = ""
-        elif ks == "Escape":
-            name = self._backup
-        else:
-            name = self.KEYMAP.get(ks, ks.lower() if len(ks) == 1 else ks.lower())
-        self.var.set(name if name else "-")
+        name = self._backup if ks == "Escape" else \
+            self.KEYMAP.get(ks, ks.lower() if len(ks) == 1 else ks.lower())
+        self.var.set(name or "-")
         self._capturing = False
         self.configure(fg=ACCENT, bg=PANEL_2)
         if self._on_change:
