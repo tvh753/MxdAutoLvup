@@ -128,6 +128,16 @@ class ConfigManager:
         if migrate_player_template(self.cfg):
             self.save()  # 清洗结果落盘，下次启动不再报错
 
+        # player_dot_color 合法性清洗：畸形值直接移除（校准后会写回正确值）
+        p = self.cfg.get("patrol", {})
+        pdc = p.get("player_dot_color")
+        if pdc is not None and not (
+                isinstance(pdc, list) and len(pdc) == 3
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        and 0 <= v <= 255 for v in pdc)):
+            p.pop("player_dot_color", None)
+            self.save()
+
     def save(self):
         try:
             with open(self.path, "w", encoding="utf-8") as f:

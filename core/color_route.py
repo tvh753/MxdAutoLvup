@@ -105,14 +105,39 @@ class ColorRouteNavigator:
         self._consumed = {}
         self._update_hue()
 
+    @staticmethod
+    def _parse_color(c):
+        """容错解析玩家点颜色 → (B,G,R) 三元组；无法解析返回 None。
+        合法形态：[b,g,r]/(b,g,r) 各 0~255；
+        兼容 '60,230,255'、'[60, 230, 255]' 等字符串形态。
+        任何越界值/超大整数/畸形类型 → None（不崩溃）。"""
+        try:
+            if isinstance(c, str):
+                parts = c.strip().strip("()[]").replace(",", " ").split()
+                vals = [int(round(float(x))) for x in parts]
+            else:
+                a = np.asarray(c, dtype=object).ravel()
+                vals = [int(round(float(x))) for x in a[:3]]
+            if len(vals) == 3 and all(0 <= v <= 255 for v in vals):
+                return tuple(vals)
+        except (ValueError, TypeError, OverflowError):
+            pass
+        return None
+
     # ================= 配置 =================
     def configure(self, minimap=None, dot_color=None, tolerance=None,
                   search_range=None, grab_tol=None, dot_max_area=None):
         if minimap and minimap[2] > 4 and minimap[3] > 4:
             self.minimap = tuple(int(v) for v in minimap)
-        if dot_color:
-            self.dot_color = np.array(dot_color, np.int16)
-            self._update_hue()
+        if dot_color is not None:
+            parsed = self._parse_color(dot_color)
+            if parsed is not None:
+                self.dot_color = np.array(parsed, np.int16)
+                self._update_hue()
+            else:
+                # 坏值不再崩溃：忽略 + 日志提示 + 保留当前颜色（默认黄）
+                self._log(f"玩家点颜色配置无效({dot_color!r})，已忽略，"
+                          "请重新「校准小地图」采样", "warn")
         if tolerance is not None:
             self.tolerance = int(tolerance)
         if search_range is not None:
@@ -319,6 +344,7 @@ class ColorRouteNavigator:
         return None
 
     def auto_sample(self, frames):
+        """多帧采样玩家黄点颜色：只取小而紧凑的高饱和亮黄斑块像素中位色"""
         x, y, w, h = self.minimap
         if w <= 4 or not frames:
             return None
@@ -333,15 +359,23 @@ class ColorRouteNavigator:
             roi = f[y:y2, x:x2]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             m = cv2.inRange(hsv, (15, 100, 150), (40, 255, 255))
-            n, _, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+            if not m.any():
+                continue
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
             for i in range(1, n):
-                a = stats[i][cv2.CC_STAT_AREA]
+                a = int(stats[i][cv2.CC_STAT_AREA])
                 if 2 <= a <= 60 and stats[i][cv2.CC_STAT_WIDTH] <= 8 \
                         and stats[i][cv2.CC_STAT_HEIGHT] <= 8:
-                    pixels.append(roi[m == i])
+                    sel = roi[labels == i]  # 用标签图选区（不是掩码）
+                    if sel.size:  # 空选区不入列
+                        pixels.append(sel)
         if not pixels:
             return None
-        med = np.median(np.vstack(pixels), axis=0).astype(int)
+        med = np.median(np.vstack(pixels), axis=0).astype(np.float64)
+        if np.isnan(med).any():  # NaN 防线
+            self._log("玩家点颜色采样异常(NaN)，保留原颜色", "warn")
+            return None
+        med = np.clip(med, 0, 255).astype(int)
         self.dot_color = np.array(med, dtype=np.int16)
         self._update_hue()
         return med.tolist()

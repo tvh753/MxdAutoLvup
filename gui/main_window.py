@@ -714,7 +714,12 @@ class App(tk.Tk):
             messagebox.showerror("错误", f"地图包保存失败：{e}", parent=self)
             return
         # 回填：底图可能被自动补拍；路线可能来自包内旧图
-        self._minimap_snap = self.maps.load_minimap(name) or self._minimap_snap
+        mm_img = self.maps.load_minimap(name)
+        if mm_img is not None:
+            self._minimap_snap = mm_img  # ← 不能用 or，数组真值歧义
+        if self._route_img is None:
+            self._route_img = self.maps.load_route(name)
+
         if self._route_img is None:
             self._route_img = self.maps.load_route(name)
         if self._minimap_snap is not None:
