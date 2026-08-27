@@ -176,6 +176,7 @@ class BotEngine(threading.Thread):
                 base = imread_u(os.path.join(os.path.dirname(rp), "minimap.png"))
                 self._nav_base = base if (base is not None and
                                           base.shape[:2] == img.shape[:2]) else None
+                self.route_nav.set_base(self._nav_base)   # 滚动补偿需要底图
                 self.log(f"颜色路线已加载：{os.path.basename(os.path.dirname(rp))}"
                          + ("" if self._nav_base is not None else "（无小地图底图）"))
         self.move.bind(self.cfg["keys"])
@@ -401,6 +402,13 @@ class BotEngine(threading.Thread):
                 if now - self._offroute_log_t > 8:
                     self._offroute_log_t = now
                     self.log(f"已偏离路线 {off:.0f}px，放弃追击回归路线", "info")
+        # 定位丢失期间不打怪：off-route 检查依赖玩家点，盲打会把角色
+        # 一直拖离路线直到地图边缘（本次边缘卡死的帮凶）
+        elif can_fight and patrol_on and player_map is None:
+            can_fight = False
+            if now - getattr(self, "_blind_log_t", 0.0) > 10.0:
+                self._blind_log_t = now
+                self.log("玩家点定位丢失，暂停战斗先找回位置", "info")
         fought = False
         if monsters and can_fight:
             # 追击距离：巡逻时只追屏幕距离内的怪（远处怪不追，继续走线）
@@ -632,6 +640,7 @@ class BotEngine(threading.Thread):
     def set_nav_base(self, img):
         """GUI 录制/加载小地图底图后注入（导航面板背景）"""
         self._nav_base = img
+        self.route_nav.set_base(img)
 
     NAV_W = 176  # 导航面板显示宽度（预览右上角）
 

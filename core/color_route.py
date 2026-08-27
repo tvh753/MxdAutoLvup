@@ -82,11 +82,24 @@ class ColorRouteNavigator:
         self._last_pos = None
         self._move_t = time.time()
         self._dot_seen_t = -99.0
-        self._acq = None
+        self._probe = None  # 试探定位状态机
         self._h_lo, self._h_hi = 20, 33
         self._no_cand_t = 0.0
         self._no_cand_log_t = -99.0
+        self._probe_fail_log_t = -99.0
         self.debug_cands = []
+        # 锁定有效性看门狗
+        self._walk_t0 = None
+        self._walk_p0 = None
+        # ---- 滚动补偿（大地图小地图随玩家滚动，标记是录制时坐标） ----
+        self._base = None
+        self._shift = None  # (dx,dy)：底图内容相对当前帧的位移
+        self._shift_t = -99.0
+        self._bad_since = 0.0
+        self._shift_log_t = -99.0
+        # ---- 回归路线状态（防卡楔） ----
+        self._ret = None
+        self._step_pos = None  # step 内部坐标(底图系)，与跟踪器 live 坐标分离
         # ---- 爬绳状态机 ----
         self._phase = "none"
         self._t0 = 0.0
@@ -128,7 +141,13 @@ class ColorRouteNavigator:
     def configure(self, minimap=None, dot_color=None, tolerance=None,
                   search_range=None, grab_tol=None, dot_max_area=None):
         if minimap and minimap[2] > 4 and minimap[3] > 4:
-            self.minimap = tuple(int(v) for v in minimap)
+            nm = tuple(int(v) for v in minimap)
+            if nm != self.minimap:
+                self.minimap = nm
+                self._last_pos = None
+                self._probe = None
+                self._shift = None
+                self._ret = None
         if dot_color is not None:
             parsed = self._parse_color(dot_color)
             if parsed is not None:
@@ -203,7 +222,10 @@ class ColorRouteNavigator:
         self._cur_dir = 0
         self._last_mark = None
         self._last_pos = None
-        self._acq = None
+        self._probe = None
+        self._walk_t0 = None
+        self._ret = None
+        self._shift = None
         self._reset_climb()
 
     def _reset_climb(self):
@@ -220,10 +242,10 @@ class ColorRouteNavigator:
         self._reset_climb()
 
     def stuck_seconds(self):
-        return max(0.0, time.time() - self._move_t) if self._last_pos is not None else 0.0
+        return max(0.0, time.time() - self._move_t) if self._step_pos is not None else 0.0
 
     # ================= 玩家定位 =================
-    def player_pos(self, frame_bgr):
+    def _player_pos_raw(self, frame_bgr):
         x, y, w, h = self.minimap
         if w <= 4 or h <= 4 or frame_bgr is None:
             return None
@@ -264,13 +286,14 @@ class ColorRouteNavigator:
             self._last_pos = None  # 彻底丢失 → 重新捕获
             self._acq = None
             return None
-        # —— 未锁定：闪烁判别初始捕获 ——
-        pos = self._acquire(cands, now)
-        if pos is not None:
-            self._dot_seen_t = now
-            self._last_pos = pos
-            self._log(f"🧭 玩家点已锁定 ({pos[0]:.0f},{pos[1]:.0f})，开始路线导航", "ok")
-        return pos
+
+        # —— 未锁定：试探移动定位（v7，替代闪烁判别，低帧率可靠） ——
+        if self._probe is None:
+            self._probe = {"phase": "base", "t0": now, "dir": -1, "try": 0,
+                           "base": [], "walk": []}
+            self._log("🧭 试探定位：控制角色短暂左右移动以识别玩家点"
+                      "（低帧率下比闪烁判别可靠）", "info")
+        return self._probe_step(cands, now)
 
     def _dot_candidates(self, roi):
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -302,63 +325,79 @@ class ColorRouteNavigator:
         lx, ly = self._last_pos
         return min(cands, key=lambda c: (c[0] - lx) ** 2 + (c[1] - ly) ** 2)[:2]
 
-    def _acquire(self, cands, now):
-        """初始捕获 v6 —— 时间驱动，低FPS自适应。
-        旧版固定攒12帧/窗口2.5s，需 ≥4.8FPS；FPS=3 时永远攒不满，
-        玩家点永远锁定不了（“定位玩家点中…”卡死的根因）。
-        新版：攒满12帧 或 (≥2.2s 且 ≥5帧) 即评估。"""
-        if self._acq is None:
-            self._acq = {"t0": now, "frames": []}
-        acq = self._acq
-        acq["frames"].append(cands)
-        n = len(acq["frames"])
-        elapsed = now - acq["t0"]
-        if elapsed > 6.0 or n > 40:  # 超长窗口丢弃重开
-            self._acq = None
+    # ================= 试探移动定位（v7） =================
+    def _probe_dir(self):
+        p = self._probe
+        return p["dir"] if p and p["phase"] == "walk" else 0
+
+    def _probe_step(self, cands, now):
+        p = self._probe
+        if p["phase"] == "base":  # 静止取基线
+            p["base"].extend((c[0], c[1]) for c in cands)
+            if now - p["t0"] >= 0.45:
+                p["phase"], p["t0"] = "walk", now
+                p["dir"] = -1 if p["try"] % 2 == 0 else 1
             return None
-        if not (n >= 12 or (elapsed >= 2.2 and n >= 5)):
+        p["walk"].extend((c[0], c[1]) for c in cands)
+        if now - p["t0"] < 0.8:
             return None
-        frames = acq["frames"]
-        pts = {}
-        for fs in frames:
-            seen = set()
-            for cx, cy, a in fs:
-                key = (int(cx) // 5, int(cy) // 5)
-                if key in seen:
-                    continue
-                seen.add(key)
-                e = pts.setdefault(key, [0.0, 0.0, 0, 0])
-                e[0] += cx
-                e[1] += cy
-                e[2] += 1
-                e[3] += a
-        total = n
-        blink, steady = [], []
-        for (_, _), (sx, sy, cnt, sa) in pts.items():
-            pos = (sx / cnt, sy / cnt, sa / max(1, cnt))
-            if 2 <= cnt < total:  # 出现但非全程 → 闪烁(玩家)
-                blink.append(pos)
-            elif cnt == total:  # 全程常亮 → 疑似NPC
-                steady.append(pos)
-        self._acq = None
-        if blink:
-            self._acq_fails = 0
-            best = max(blink, key=lambda p: p[2])  # 面积最大的闪烁簇
-            return (best[0], best[1])
-        if len(steady) == 1:  # 唯一常亮兜底
-            self._acq_fails = 0
-            self._log("玩家点定位：无闪烁样本，采用唯一常亮候选兜底锁定"
-                      "（若位置有误请重新校准小地图）", "warn")
-            return (steady[0][0], steady[0][1])
-        # 失败（多常亮无闪烁=NPC多，或样本不足）→ 下帧自动重开窗口重试
-        self._acq_fails = getattr(self, "_acq_fails", 0) + 1
-        if self._acq_fails >= 3 and \
-                now - getattr(self, "_acq_fail_log_t", -99.0) > 20:
-            self._acq_fail_log_t = now
-            self._log(f"玩家点锁定失败×{self._acq_fails}（候选 {len(pts)} 个，"
-                      "无法区分闪烁）：小地图上NPC/玩家点过多所致，属正常重试；"
-                      "持续失败请移动到人少的区域", "warn")
+        # 评估：找“离开了基线位置”的点 = 玩家（NPC 静止，位移≈0）
+        base = np.array(p["base"], np.float32) if p["base"] \
+            else np.zeros((0, 2), np.float32)
+        best, best_score = None, 2.5
+        for wx, wy in p["walk"]:
+            if len(base):
+                d = np.sqrt(((base - (wx, wy)) ** 2).sum(1))
+                j = int(d.argmin())
+                disp, bx = float(d[j]), float(base[j][0])
+            else:  # 基线期无任何点：新出现的即玩家
+                disp, bx = 30.0, wx - 10 * p["dir"]
+            if disp < 2.5:
+                continue
+            bonus = 2.0 if (wx - bx) * p["dir"] > 0 else 1.0  # 移动方向与指令一致加分
+            if disp * bonus > best_score:
+                best_score, best = disp * bonus, (wx, wy)
+        if best is not None:
+            self._probe = None
+            self._last_pos = best
+            self._dot_seen_t = now
+            self._log(f"🧭 玩家点已锁定(试探) ({best[0]:.0f},{best[1]:.0f})", "ok")
+            return best
+        p["try"] += 1  # 未找到移动点 → 换方向重试
+        p["phase"], p["t0"] = "base", now
+        p["base"], p["walk"] = [], []
+        if p["try"] >= 6 and now - self._probe_fail_log_t > 20:
+            self._probe_fail_log_t = now
+            self._log("试探定位多次未找到移动点：角色可能被卡住，持续重试中"
+                      "（长期无效请检查小地图区域框选）", "warn")
         return None
+
+    def _nearest_mark(self, x, y):
+        if self._marks_xy is None or len(self._marks_xy) == 0:
+            return None
+        d = np.sqrt(((self._marks_xy - np.float32((x, y))) ** 2).sum(1))
+        i = int(d.argmin())
+        return float(self._marks_xy[i][0]), float(self._marks_xy[i][1])
+
+    def _watchdog(self, cmd, pos, now):
+        """移动指令下跟踪点长期静止 → 锁到了静态物 → 丢弃重锁。
+        阈值 5.0s > 回归换向 3.5s：真被墙卡时先换向绕行，别急着扔正确锁定"""
+        if not cmd.dir:
+            self._walk_t0 = None
+            return
+        if (self._walk_t0 is None or
+                abs(pos[0] - self._walk_p0[0]) >= 2 or
+                abs(pos[1] - self._walk_p0[1]) >= 2):
+            self._walk_t0, self._walk_p0 = now, pos
+            return
+        if now - self._walk_t0 > 5.0:
+            self._walk_t0 = None
+            self._last_pos = None
+            self._step_pos = None
+            self._probe = None
+            self._ret = None
+            self._log("⚠ 跟踪点在移动指令下长期静止，疑似锁定到静态黄点，"
+                      "重新试探定位", "warn")
 
     def auto_sample(self, frames):
         """多帧采样玩家黄点颜色：只取小而紧凑的高饱和亮黄斑块像素中位色"""
@@ -424,19 +463,26 @@ class ColorRouteNavigator:
             return RouteCmd(status="未加载颜色路线")
         if pos is None:
             self._reset_climb()
+            if self._probe is not None:
+                return RouteCmd(dir=self._probe_dir(), status="🔍 试探移动定位…")
             return RouteCmd(status="🧭 定位玩家点中…")
-        if (self._last_pos is None or
-                abs(pos[0] - self._last_pos[0]) >= MOVE_EPS or
-                abs(pos[1] - self._last_pos[1]) >= MOVE_EPS):
+        if (self._step_pos is None or
+                abs(pos[0] - self._step_pos[0]) >= MOVE_EPS or
+                abs(pos[1] - self._step_pos[1]) >= MOVE_EPS):
             self._move_t = now
-        self._last_pos = pos
+        self._step_pos = pos
         x, y = int(round(pos[0])), int(round(pos[1]))
         cands = self._candidates(x, y, self.search_range)
         if not cands:
             cands = self._candidates(x, y, int(self.search_range * 1.8))
         if not cands:
-            return self._lost(x, now)
+            cmd = self._lost(x, y, now)
+            self._watchdog(cmd, pos, now)  # ★ 盲区也查错锁（v7 遗漏）
+            if cmd.dir:
+                self._cur_dir = cmd.dir
+            return cmd
         self._last_seen_t = now
+        self._ret = None  # 已回标记附近，清回归状态
         d, idx, mx, my = self._choose(cands, x, now)
         self._last_mark = (mx, my)
         hh, v, act, nm = self._codes[idx]
@@ -445,6 +491,7 @@ class ColorRouteNavigator:
             self._cur_dir = cmd.dir
         elif cmd.stop:
             self._cur_dir = 0
+        self._watchdog(cmd, pos, now)
         return cmd
 
     def _candidates(self, x, y, r):
@@ -492,14 +539,52 @@ class ColorRouteNavigator:
 
         return min(pool, key=score)
 
-    def _lost(self, x, now):
+    def _lost(self, x, y, now):
+        # 短时穿越标记间隙：方向惯性
         if now - self._last_seen_t < LOST_MOMENTUM and self._cur_dir:
             return RouteCmd(dir=self._cur_dir, status="… 穿越标记间隙")
-        if self._last_mark:
-            dx = self._last_mark[0] - x
-            if abs(dx) > 3:
-                return RouteCmd(dir=1 if dx > 0 else -1, status="↩ 返回路线")
-        return RouteCmd(dir=0, status="⚠ 偏离路线，原地等待")
+        # —— 回归路线：直线受阻自动换目标/换向，不再对着墙死跳 ——
+        if self._ret is None:
+            tgt = self._nearest_mark(x, y)
+            if tgt is None:
+                return RouteCmd(dir=0, status="⚠ 路线图无可用标记")
+            self._ret = {"tgt": tgt, "p": (x, y), "t": now, "flips": 0}
+        r = self._ret
+        if abs(x - r["p"][0]) >= 2 or abs(y - r["p"][1]) >= 2:
+            r["p"], r["t"] = (x, y), now  # 有位移，刷新
+        elif now - r["t"] > 3.5:  # 3.5s 没挪窝=受阻
+            r["t"], r["flips"] = now, r["flips"] + 1
+            if r["flips"] <= 2:
+                alt = self._flip_target(x, y, r["tgt"])
+                if alt:
+                    r["tgt"] = alt
+                    self._log("↩ 直线回归受阻，改道另一侧标记绕回", "info")
+                else:
+                    self._cur_dir = -(self._cur_dir or 1)
+                    self._log("↩ 回归受阻，反向沿路线绕行(环线)", "info")
+            else:
+                r["flips"] = 0
+                r["tgt"] = self._nearest_mark(x, y) or r["tgt"]
+        dx = r["tgt"][0] - x
+        if abs(dx) > 3:
+            d = 1 if dx > 0 else -1
+            return RouteCmd(dir=d, status="↩ 返回路线")
+        if now - self._jump_t > 1.0:  # x已对齐但目标在异层→跳，别干站
+            self._jump_t = now
+            return RouteCmd(dir=0, jump=True, status="↗ 回归点在异层，跳跃尝试")
+        return RouteCmd(dir=0, status="⚠ 偏离路线(异层)，尝试回层中")
+
+    def _flip_target(self, x, y, cur):
+        """换一个在另一侧的近标记（环线绕回用）"""
+        if self._marks_xy is None:
+            return None
+        d = np.sqrt(((self._marks_xy - np.float32((x, y))) ** 2).sum(1))
+        cur_side = (cur[0] - x) >= 0
+        for i in np.argsort(d)[:80]:
+            mx, my = self._marks_xy[i]
+            if ((mx - x) >= 0) != cur_side and d[i] < 200:
+                return (float(mx), float(my))
+        return None
 
     def _dispatch(self, idx, mx, my, hh, v, act, nm, x, y, now):
         if act in CONSUMABLE:
@@ -577,3 +662,74 @@ class ColorRouteNavigator:
         # —— 到位：先停步再抓（带横移速度起跳容易冲过绳子） ——
         self._phase, self._t0, self._y0, self._grab_jumped = "grab", now, y, False
         return RouteCmd(dir=0, status="🪢 停步准备抓绳")
+
+    def set_base(self, base_bgr):
+        """注入录制时的小地图底图（滚动补偿基准）"""
+        self._base = base_bgr
+        self._shift = None
+        self._bad_since = 0.0
+
+    def _roi(self, frame_bgr):
+        if frame_bgr is None:
+            return None
+        x, y, w, h = self.minimap
+        if w <= 4 or h <= 4:
+            return None
+        H, W = frame_bgr.shape[:2]
+        x2, y2 = min(x + w, W), min(y + h, H)
+        if x < 0 or y < 0 or x2 <= x or y2 <= y:
+            return None
+        return frame_bgr[y:y2, x:x2]
+
+    def _scroll_shift(self, roi):
+        """估计当前小地图相对录制底图的滚动位移。
+        底图中央 55% 区域作模板，在当前帧里找它挪到了哪 → 位移量。
+        匹配置信度低/位移过大 → None（维持上次偏移）。"""
+        if self._base is None:
+            return None
+        bh, bw = self._base.shape[:2]
+        rh, rw = roi.shape[:2]
+        if (bh, bw) != (rh, rw):
+            return None
+        ph, pw = int(rh * 0.55), int(rw * 0.55)
+        py, px = (rh - ph) // 2, (rw - pw) // 2
+        tpl = cv2.cvtColor(self._base[py:py + ph, px:px + pw],
+                           cv2.COLOR_BGR2GRAY)
+        if float(tpl.std()) < 8:  # 底图太平坦，不可靠
+            return None
+        live = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        res = cv2.matchTemplate(live, tpl, cv2.TM_CCOEFF_NORMED)
+        _, mv, _, ml = cv2.minMaxLoc(res)
+        if mv < 0.55:
+            return None
+        dx, dy = ml[0] - px, ml[1] - py
+        if abs(dx) > rw // 3 or abs(dy) > rh // 3:
+            return None
+        return (dx, dy)
+
+    def player_pos(self, frame_bgr):
+        pos = self._player_pos_raw(frame_bgr)
+        if pos is None:
+            return None
+        if self._base is None:
+            return pos
+        now = time.time()
+        if now - self._shift_t > 0.7:  # 限频：约每2帧估一次
+            self._shift_t = now
+            roi = self._roi(frame_bgr)
+            s = self._scroll_shift(roi) if roi is not None else None
+            if s is not None:
+                self._shift, self._bad_since = s, 0.0
+            else:
+                if self._bad_since == 0.0:
+                    self._bad_since = now
+                if self._shift is not None and now - self._bad_since > 3.0 \
+                        and now - self._shift_log_t > 20.0:
+                    self._shift_log_t = now
+                    self._log("⚠ 小地图与录制底图对不上（可能滚出录制范围），"
+                              "请让角色回到录制路线附近", "warn")
+        if self._shift is None:
+            return pos
+        dx, dy = self._shift
+        self.debug_cands = [(cx - dx, cy - dy) for (cx, cy) in self.debug_cands]
+        return (pos[0] - dx, pos[1] - dy)  # live → 底图坐标系
