@@ -692,21 +692,33 @@ class App(tk.Tk):
         RoutePainter(self, self._minimap_snap, self._route_img, on_ok=ok)
 
     def save_map_pack(self):
-        if self._minimap_snap is None:
-            messagebox.showwarning("提示", "请先「录制小地图」再保存地图包", parent=self)
-            return
-        name = simpledialog.askstring("地图包命名", "地图名称（如：蘑菇山）：", parent=self)
+        name = self.maps_combo.get().strip()
+        if not name:
+            name = (simpledialog.askstring("地图包命名", "地图名称（如：蘑菇山）：",
+                                           parent=self) or "").strip()
         if not name:
             return
         if name in self.maps.list_maps() and not messagebox.askyesno(
                 "覆盖确认", f"地图包「{name}」已存在，覆盖保存？", parent=self):
             return
+        mm = self.cfg.get("patrol", {}).get("minimap", {})
+        if mm.get("w", 0) < 5:
+            messagebox.showwarning("提示", "请先「🧭 校准小地图」再保存地图包",
+                                   parent=self)
+            return
         try:
-            self.maps.save(name, self.cfg, self._minimap_snap, self._route_img)
+            self.maps.save(name, self.cfg, self._minimap_snap, self._route_img,
+                           grab_fn=lambda: self._grab_frame())  # 缺底图自动补拍
         except Exception as e:
             self.log(f"地图包保存失败: {e}", "error")
             messagebox.showerror("错误", f"地图包保存失败：{e}", parent=self)
             return
+        # 回填：底图可能被自动补拍；路线可能来自包内旧图
+        self._minimap_snap = self.maps.load_minimap(name) or self._minimap_snap
+        if self._route_img is None:
+            self._route_img = self.maps.load_route(name)
+        if self._minimap_snap is not None:
+            self.engine.set_nav_base(self._minimap_snap)
         p = self.cfg.setdefault("patrol", {})
         p["current_map"] = name
         p["route_path"] = os.path.join(self.maps.maps_dir, name, "route.png")
@@ -716,7 +728,10 @@ class App(tk.Tk):
         self.refresh_maps()
         self.refresh_patrol_label()
         self.patrol_var.set(True)
-        self.log(f"🗺 地图包「{name}」已保存（路线+怪物模板+配置），巡逻已自动启用", "ok")
+        self.log(f"🗺 地图包「{name}」已保存：绑定怪物 "
+                 f"{len(self.cfg.get('monster_templates', []))} 个 · "
+                 f"底图{'✓' if self._minimap_snap is not None else '✗(未绑定窗口无法补拍)'} · "
+                 f"路线{'✓' if self._route_img is not None else '✗'}，巡逻已启用", "ok")
 
     def load_map_pack(self):
         name = self.maps_combo.get()
