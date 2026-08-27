@@ -303,14 +303,22 @@ class ColorRouteNavigator:
         return min(cands, key=lambda c: (c[0] - lx) ** 2 + (c[1] - ly) ** 2)[:2]
 
     def _acquire(self, cands, now):
-        """初始捕获：优先闪烁簇（玩家点闪烁率 0.15~0.92，NPC 常亮≈1.0）；
-        无闪烁簇时，仅存在唯一常亮候选则兜底锁定（无 NPC 地图场景）"""
-        if self._acq is None or now - self._acq["t0"] > 2.5:
+        """初始捕获 v6 —— 时间驱动，低FPS自适应。
+        旧版固定攒12帧/窗口2.5s，需 ≥4.8FPS；FPS=3 时永远攒不满，
+        玩家点永远锁定不了（“定位玩家点中…”卡死的根因）。
+        新版：攒满12帧 或 (≥2.2s 且 ≥5帧) 即评估。"""
+        if self._acq is None:
             self._acq = {"t0": now, "frames": []}
-        self._acq["frames"].append(cands)
-        frames = self._acq["frames"]
-        if len(frames) < 12:
+        acq = self._acq
+        acq["frames"].append(cands)
+        n = len(acq["frames"])
+        elapsed = now - acq["t0"]
+        if elapsed > 6.0 or n > 40:  # 超长窗口丢弃重开
+            self._acq = None
             return None
+        if not (n >= 12 or (elapsed >= 2.2 and n >= 5)):
+            return None
+        frames = acq["frames"]
         pts = {}
         for fs in frames:
             seen = set()
@@ -320,27 +328,36 @@ class ColorRouteNavigator:
                     continue
                 seen.add(key)
                 e = pts.setdefault(key, [0.0, 0.0, 0, 0])
-                e[0] += cx;
-                e[1] += cy;
-                e[2] += 1;
+                e[0] += cx
+                e[1] += cy
+                e[2] += 1
                 e[3] += a
-        total = len(frames)
+        total = n
         blink, steady = [], []
         for (_, _), (sx, sy, cnt, sa) in pts.items():
-            ratio = cnt / total
             pos = (sx / cnt, sy / cnt, sa / max(1, cnt))
-            if 0.15 <= ratio <= 0.92:
+            if 2 <= cnt < total:  # 出现但非全程 → 闪烁(玩家)
                 blink.append(pos)
-            elif ratio > 0.92:
+            elif cnt == total:  # 全程常亮 → 疑似NPC
                 steady.append(pos)
         self._acq = None
         if blink:
+            self._acq_fails = 0
             best = max(blink, key=lambda p: p[2])  # 面积最大的闪烁簇
             return (best[0], best[1])
-        if len(steady) == 1:  # 唯一常亮 → 兜底锁定
-            self._log("玩家点定位：无闪烁簇，采用唯一常亮候选兜底锁定"
+        if len(steady) == 1:  # 唯一常亮兜底
+            self._acq_fails = 0
+            self._log("玩家点定位：无闪烁样本，采用唯一常亮候选兜底锁定"
                       "（若位置有误请重新校准小地图）", "warn")
             return (steady[0][0], steady[0][1])
+        # 失败（多常亮无闪烁=NPC多，或样本不足）→ 下帧自动重开窗口重试
+        self._acq_fails = getattr(self, "_acq_fails", 0) + 1
+        if self._acq_fails >= 3 and \
+                now - getattr(self, "_acq_fail_log_t", -99.0) > 20:
+            self._acq_fail_log_t = now
+            self._log(f"玩家点锁定失败×{self._acq_fails}（候选 {len(pts)} 个，"
+                      "无法区分闪烁）：小地图上NPC/玩家点过多所致，属正常重试；"
+                      "持续失败请移动到人少的区域", "warn")
         return None
 
     def auto_sample(self, frames):
