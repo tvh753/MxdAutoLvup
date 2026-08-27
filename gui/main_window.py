@@ -794,7 +794,16 @@ class App(tk.Tk):
         if self.cfg.get("patrol", {}).get("current_map") == name:
             self.cfg["patrol"]["current_map"] = ""
             self.cfg["patrol"]["route_path"] = ""
-            self.cfg["monster_templates"] = []  # 绑定的怪物一并解绑
+            t = self.cfg["monster_templates"].pop()  # 绑定的怪物一并解绑
+
+            p = t.get("path", "")  # t = 被删的模板条目
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                    self.log(f"模板文件已删除: {os.path.basename(p)}", "info")
+                except OSError:
+                    pass
+
             self._minimap_snap = None
             self._route_img = None
             self.cfg_mgr.save()
@@ -879,7 +888,7 @@ class App(tk.Tk):
             self._show_preview(ann)
 
         st = self.engine.status
-        self.hp_bar_w.set(st["hp"]);
+        self.hp_bar_w.set(st["hp"])
         self.mp_bar_w.set(st["mp"])
         self.exp_bar_w.set(st["exp"])
         self.chip_fps.config(text=str(st["fps"]))
