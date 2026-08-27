@@ -177,6 +177,14 @@ class BotEngine(threading.Thread):
         """切换地图包前调用，强制 reload 重新读文件"""
         self._route_path_loaded = None
 
+    def clear_route(self):
+        """删除地图包后调用：路线/底图/玩家点锁定全部复位"""
+        self.route_nav.on_log = None
+        self.route_nav = ColorRouteNavigator()
+        self.route_nav.on_log = self.log
+        self._route_path_loaded = None
+        self._nav_base = None
+
     def _anchor_x(self, frame):
         p = self._last_player
         return p[0] if p is not None else frame.shape[1] // 2
