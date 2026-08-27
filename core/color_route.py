@@ -292,6 +292,7 @@ class ColorRouteNavigator:
                 pos = self._pick(self._cc_filter(acc, 2, self.dot_max_area * 3,
                                                  side=10 ** 6))
                 if pos is not None:
+                    self._dot_seen_t = now  # ← 补上：兜底成功也算"刚见过"
                     return pos
             if now - self._dot_seen_t < 1.5:  # 短暂遮挡：沿用末位位置
                 return self._last_pos
@@ -299,12 +300,12 @@ class ColorRouteNavigator:
             self._acq = None
             return None
 
-        # —— 未锁定：试探移动定位（v7，替代闪烁判别，低帧率可靠） ——
+        # —— 未锁定：往返试探定位（v11，方向一致性判别） ——
         if self._probe is None:
             self._probe = {"phase": "base", "t0": now, "dir": -1, "try": 0,
-                           "base": [], "walk": []}
-            self._log("🧭 试探定位：控制角色短暂左右移动以识别玩家点"
-                      "（低帧率下比闪烁判别可靠）", "info")
+                           "base": [], "a": [], "b": [], "jump": False}
+            self._log("🧭 试探定位：控制角色往返走一小段以识别玩家点"
+                      "（往返方向一致才算，防止锁到别的玩家/图标）", "info")
         return self._probe_step(cands, now)
 
     def _dot_candidates(self, roi):
@@ -340,49 +341,86 @@ class ColorRouteNavigator:
     # ================= 试探移动定位（v7） =================
     def _probe_dir(self):
         p = self._probe
-        return p["dir"] if p and p["phase"] == "walk" else 0
+        if not p:
+            return 0
+        if p["phase"] == "walkA":
+            return p["dir"]
+        if p["phase"] == "walkB":
+            return -p["dir"]
+        return 0
+
+    def probe_walking(self):
+        """试探定位移动段进行中（引擎此间不打断，保证定位质量）"""
+        return bool(self._probe is not None
+                    and self._probe.get("phase") in ("walkA", "walkB"))
 
     def _probe_step(self, cands, now):
+        """往返试探 v11：去程+回程方向一致性判别。
+        旧版单程"谁动锁谁"会锁到：a)恰好在窗口内走动的其他玩家；
+        b)大地图滚动时逆指令"移动"的静态图标；c)角色被卡死时任何动的东西。
+        新判据（同时满足）：①去程沿指令方向位移≥2.5px
+        ②回程回到出发点±4px ③离路线近者优先"""
         p = self._probe
-        if p["phase"] == "base":  # 静止取基线
+        ph = p["phase"]
+        if ph == "base":  # 静止取基线
             p["base"].extend((c[0], c[1]) for c in cands)
             if now - p["t0"] >= 0.45:
-                p["phase"], p["t0"] = "walk", now
+                p["phase"], p["t0"] = "walkA", now
                 p["dir"] = -1 if p["try"] % 2 == 0 else 1
             return None
-        p["walk"].extend((c[0], c[1]) for c in cands)
-        if now - p["t0"] < 0.8:
+        if ph == "walkA":  # 去程
+            p["a"].extend((c[0], c[1]) for c in cands)
+            if now - p["t0"] >= 0.9:
+                p["phase"], p["t0"] = "walkB", now
             return None
-        # 评估：找“离开了基线位置”的点 = 玩家（NPC 静止，位移≈0）
-        base = np.array(p["base"], np.float32) if p["base"] \
-            else np.zeros((0, 2), np.float32)
-        best, best_score = None, 2.5
-        for wx, wy in p["walk"]:
-            if len(base):
-                d = np.sqrt(((base - (wx, wy)) ** 2).sum(1))
-                j = int(d.argmin())
-                disp, bx = float(d[j]), float(base[j][0])
-            else:  # 基线期无任何点：新出现的即玩家
-                disp, bx = 30.0, wx - 10 * p["dir"]
-            if disp < 2.5:
-                continue
-            bonus = 2.0 if (wx - bx) * p["dir"] > 0 else 1.0  # 移动方向与指令一致加分
-            if disp * bonus > best_score:
-                best_score, best = disp * bonus, (wx, wy)
+        p["b"].extend((c[0], c[1]) for c in cands)  # 回程（反向）
+        if now - p["t0"] < 0.9:
+            return None
+        # ---- 往返一致性评估 ----
+        base = np.array(p["base"], np.float32)
+        B = np.array(p["b"], np.float32)
+        d = p["dir"]
+        best, best_score = None, 0.0
+        if len(base) and len(p["a"]) and len(B):
+            for ax, ay in p["a"]:
+                dist = np.sqrt(((base - (ax, ay)) ** 2).sum(1))
+                j = int(dist.argmin())
+                bx, by = float(base[j][0]), float(base[j][1])
+                if dist[j] < 2.5 or (ax - bx) * d < 2.5:
+                    continue  # 没动 / 逆指令动 → 静态物或滚动背景，排除
+                if float(np.sqrt(((B - (bx, by)) ** 2).sum(1)).min()) > 4.0:
+                    continue  # 回程没回到出发点 → 路过的其他玩家，排除
+                score = float(dist[j])
+                if self._marks_xy is not None:  # 真实玩家几乎总在路线附近
+                    off = self.off_route_distance((bx, by))
+                    score *= 2.0 if off < 40 else (0.3 if off > 80 else 1.0)
+                if score > best_score:
+                    best_score, best = score, (bx, by)
         if best is not None:
             self._probe = None
             self._last_pos = best
             self._dot_seen_t = now
-            self._log(f"🧭 玩家点已锁定(试探) ({best[0]:.0f},{best[1]:.0f})", "ok")
+            self._shift_t = -99.0  # 新锁定后强制重估滚动偏移，防旧值污染
+            self._log(f"🧭 玩家点已锁定(往返试探) ({best[0]:.0f},{best[1]:.0f})", "ok")
+            if self._marks_xy is not None and (self._shift is None or
+                                               abs(self._shift[0]) + abs(self._shift[1]) < 6):
+                off = self.off_route_distance(best)
+                if off > 80:
+                    self._log(f"⚠ 新锁定点距路线 {off:.0f}px 偏远：若角色此刻确实"
+                              "在路线附近，多半是小地图框选范围与录制时不一致——"
+                              "重新「录制小地图」+重绘路线可修复", "warn")
             return best
-        p["try"] += 1  # 未找到移动点 → 换方向重试
+        p["try"] += 1  # 失败 → 换方向重试；隔次起跳脱困（防卡死死循环）
         p["phase"], p["t0"] = "base", now
-        p["base"], p["walk"] = [], []
+        p["base"], p["a"], p["b"] = [], [], []
+        if p["try"] % 2 == 1:
+            p["jump"] = True
         if p["try"] >= 6 and now - self._probe_fail_log_t > 20:
             self._probe_fail_log_t = now
             self._log("试探定位多次未找到移动点：角色可能被卡住，持续重试中"
                       "（长期无效请检查小地图区域框选）", "warn")
         return None
+
 
     def _nearest_mark(self, x, y):
         if self._marks_xy is None or len(self._marks_xy) == 0:
@@ -480,7 +518,11 @@ class ColorRouteNavigator:
                                 status="🪢 攀爬中(定位暂失)…")
             self._reset_climb()
             if self._probe is not None:
-                return RouteCmd(dir=self._probe_dir(), status="🔍 试探移动定位…")
+                cmd = RouteCmd(dir=self._probe_dir(), status="🔍 试探移动定位…")
+                if self._probe.get("jump"):  # 试探失败时请求的脱困跳
+                    self._probe["jump"] = False
+                    cmd.jump = True
+                return cmd
             return RouteCmd(status="🧭 定位玩家点中…")
         if (self._step_pos is None or
                 abs(pos[0] - self._step_pos[0]) >= MOVE_EPS or

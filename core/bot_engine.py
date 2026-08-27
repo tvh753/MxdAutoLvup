@@ -395,12 +395,8 @@ class BotEngine(threading.Thread):
         anchor = player if player is not None else \
             (frame.shape[1] // 2, frame.shape[0] // 2, 1.0, 0, 0)
         ax = anchor[0]
-        # ---------- ① 战斗（巡逻模式限距追击，防脱线） ----------
+        # ---------- ① 战斗（v10：原地可打目标豁免巡逻门禁） ----------
         can_fight = (self._giveup_until is None or now > self._giveup_until)
-        # 爬绳全流程勿扰：战斗会松开↑（掉绳）并把角色拉离绳索
-        if can_fight and patrol_on and self.route_nav.phase != "none":
-            can_fight = False
-        # 偏离路线检测：玩家点离最近标记太远 → 放弃战斗，2 秒防抖
         if can_fight and patrol_on and player_map is not None:
             off = self.route_nav.off_route_distance(player_map)
             if off > th.get("off_route_tol", 30):
@@ -410,19 +406,30 @@ class BotEngine(threading.Thread):
                 if now - self._offroute_log_t > 8:
                     self._offroute_log_t = now
                     self.log(f"已偏离路线 {off:.0f}px，放弃追击回归路线", "info")
-        # 定位丢失期间不打怪：off-route 检查依赖玩家点，盲打会把角色
-        # 一直拖离路线直到地图边缘（本次边缘卡死的帮凶）
         elif can_fight and patrol_on and player_map is None:
-            can_fight = False
+            can_fight = False  # 只禁"追"，不禁原地打（见★）
             if now - getattr(self, "_blind_log_t", 0.0) > 10.0:
                 self._blind_log_t = now
-                self.log("玩家点定位丢失，暂停战斗先找回位置", "info")
+                self.log("玩家点定位丢失，暂停追击先找回位置", "info")
+        if can_fight and patrol_on and self.route_nav.phase != "none":
+            can_fight = False  # 爬绳勿扰
+        # ★ 原地战斗豁免：目标已在攻击/技能距离内 → 原地输出零位移，
+        #   不依赖小地图定位。定位丢失/偏离/回归期间面前的怪照打。
+        #   例外：试探定位移动段(0.8s)与爬绳中
+        stand = []
+        if monsters:
+            skills_on = any(keys.get(k) for k in ("skill1", "skill2", "skill3"))
+            stand_r = max(th["attack_range"], th.get("skill_range", 260)) \
+                if skills_on else th["attack_range"]
+            stand = [m for m in monsters if abs(m[0][0] - ax) <= stand_r]
+        allow_stand = bool(stand) and self.route_nav.phase == "none" \
+                      and not self.route_nav.probe_walking()
         fought = False
-        if monsters and can_fight:
-            # 追击距离：巡逻时只追屏幕距离内的怪（远处怪不追，继续走线）
-            near = [m for m in monsters
+        if monsters and (can_fight or allow_stand):
+            targets = monsters if can_fight else stand
+            near = [m for m in targets
                     if abs(m[0][0] - ax) <= th.get("chase_range", 220)] \
-                if patrol_on else monsters
+                if patrol_on else targets
             if near:
                 fought = True
                 if self._chase_t0 is None:
