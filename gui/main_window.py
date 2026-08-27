@@ -523,17 +523,31 @@ class App(tk.Tk):
 
         def ok(rect):
             x, y, w, h = rect
-            path = os.path.join(TEMPLATE_DIR, f"player_{int(time.time() * 1000)}.png")
-            if not imwrite_u(path, frame[y:y + h, x:x + w]):
-                self.log(f"模板写入磁盘失败: {path}", "error")
+            try:
+                path = self.maps.save_player(frame[y:y + h, x:x + w])  # 全局唯一
+            except Exception as e:
+                self.log(f"玩家模板保存失败: {e}", "error")
                 return
             self.cfg["player_template"] = {"name": "玩家", "path": path}
-            self.cfg_mgr.save();
-            self.engine.reload_runtime();
+            self.cfg_mgr.save()
+            self.engine.reload_runtime()
             self.refresh_tpl_list()
-            self.log(f"玩家模板已设置 ({w}×{h})", "ok")
+            self.log(f"玩家模板已更新（全局共用，所有地图生效）", "ok")
 
-        RegionSelector(self, frame, mode="template", on_ok=ok, tip="框选你的角色本体")
+        RegionSelector(self, frame, mode="region", on_ok=ok,
+                       tip="框选角色本体（站直、无遮挡、背景简洁处）")
+
+    def clear_player(self):
+        self.cfg["player_template"] = None
+        if self.maps.player_exists():
+            try:
+                os.remove(self.maps.player_path)
+            except OSError:
+                pass
+        self.cfg_mgr.save()
+        self.engine.reload_runtime()
+        self.refresh_tpl_list()
+        self.log("玩家模板已清除（全局）", "warn")
 
     def remove_template(self):
         sel = self.tpl_listbox.curselection()
@@ -544,13 +558,6 @@ class App(tk.Tk):
         self.engine.reload_runtime();
         self.refresh_tpl_list()
         self.log(f"已删除模板「{removed['name']}」", "warn")
-
-    def clear_player(self):
-        self.cfg["player_template"] = None
-        self.cfg_mgr.save();
-        self.engine.reload_runtime();
-        self.refresh_tpl_list()
-        self.log("已清除玩家模板（将原地输出攻击）", "info")
 
     def refresh_tpl_list(self):
         self.tpl_listbox.delete(0, "end")
