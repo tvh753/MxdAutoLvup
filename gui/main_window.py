@@ -470,23 +470,51 @@ class App(tk.Tk):
 
         def ok(rect):
             x, y, w, h = rect
+            img = frame[y:y + h, x:x + w]
+            default = self._next_monster_name()
             name = simpledialog.askstring(
-                "模板命名", "为该怪物模板命名：", parent=self,
-                initialvalue=f"怪物{len(self.cfg['monster_templates']) + 1}")
-            if not name:
+                "怪物命名", "怪物名称（用于地图包绑定与日志显示）：",
+                initialvalue=default, parent=self)
+            name = (name or "").strip() or default
+            try:
+                path = self._save_monster_img(name, img)
+            except Exception as e:
+                self.log(f"怪物模板保存失败: {e}", "error")
                 return
-            path = os.path.join(TEMPLATE_DIR, f"{int(time.time() * 1000)}.png")
-            if not imwrite_u(path, frame[y:y + h, x:x + w]):
-                self.log(f"模板写入磁盘失败: {path}", "error")
-                return
-            self.cfg["monster_templates"].append({"name": name, "path": path})
-            self.cfg_mgr.save();
-            self.engine.reload_runtime();
+            self.cfg.setdefault("monster_templates", []).append(
+                {"name": name, "path": path})
+            self.cfg_mgr.save()
+            self.engine.reload_runtime()
             self.refresh_tpl_list()
-            self.log(f"新增怪物模板「{name}」({w}×{h})", "ok")
+            where = f"地图包「{self._active_pack()}」" if self._active_pack() \
+                else "公共暂存区（存为地图包时并入）"
+            self.log(f"怪物模板[{name}]已保存 → {where}", "ok")
 
-        RegionSelector(self, frame, mode="template", on_ok=ok,
-                       tip="框选怪物本体（建议刚好包住，背景越干净识别越准）")
+        RegionSelector(self, frame, mode="region", on_ok=ok,
+                       tip="框选怪物本体（含特征部位，避开血条数字）")
+
+    def _next_monster_name(self):
+        names = {t.get("name", "") for t in self.cfg.get("monster_templates", [])}
+        i = 1
+        while f"怪物{i}" in names:
+            i += 1
+        return f"怪物{i}"
+
+    def _active_pack(self):
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        return name if name in self.maps.list_maps() else ""
+
+    def _save_monster_img(self, name, img):
+        """激活地图包 → 存进包内；否则存公共暂存区"""
+        pack = self._active_pack()
+        if pack:
+            return self.maps.add_monster(pack, name, img)
+        d = os.path.join(TEMPLATE_DIR, "monsters")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"{name}_{int(time.time() * 1000) % 100000}.png")
+        if not imwrite_u(p, img):
+            raise IOError(p)
+        return p
 
     def add_player_template(self):
         frame = self._grab_frame()
