@@ -85,7 +85,8 @@
     "jump": "alt",
     "up": "up",
     "down": "down",
-    "teleport": "shift"
+    "teleport": "shift",
+    "pickup": "z"
   },
   "thresholds": {
     "match": 0.8,
@@ -94,13 +95,16 @@
     "hp_stop": 12,
     "attack_range": 160,
     "potion_cooldown": 1.2,
-    "roam_interval": 2.5
+    "roam_interval": 2.5,
+    "skill_range": 260,
+    "pickup_interval": 0.9
   },
   "options": {
     "use_skill_rotation": true,
     "jump_while_roam": true,
     "stop_on_low_hp": true,
-    "pause_on_unfocus": true
+    "pause_on_unfocus": true,
+    "loot_enabled": true
   },
   "patrol": {
     "enabled": true,
@@ -120,6 +124,7 @@
     "grab_tol": 4,
     "route_path": "D:\\test_demo\\MxdAutoLvup\\maps\\蘑菇山\\route.png",
     "current_map": "蘑菇山",
+    "dot_max_area": 40,
     "waypoints": [],
     "mode": "loop",
     "arrive_tol": 6,
@@ -127,5 +132,12 @@
     "grab_timeout": 0.9,
     "max_grab_retries": 3,
     "max_chase_time": 8.0
+  },
+  "schedule": {
+    "enabled": false,
+    "duration_min": 60,
+    "rest_lo_min": 5,
+    "rest_hi_min": 10,
+    "safe_stop_wait": 120
   }
 }

@@ -107,3 +107,12 @@ class MovementController:
                 except Exception:
                     pass
         self._h = self._v = None
+
+    @property
+    def h_dir(self):
+        """当前水平方向：+1右 / -1左 / 0静止（战斗朝向判断用）"""
+        if self._h and self._h == self._right:
+            return 1
+        if self._h and self._h == self._left:
+            return -1
+        return 0
