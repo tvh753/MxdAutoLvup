@@ -210,20 +210,25 @@ class BotEngine(threading.Thread):
         return p[0] if p is not None else frame.shape[1] // 2
 
     def _rope_assist(self, frame, cmd, now):
-        """爬绳对准阶段：主画面绳子精调（小地图缩放误差的兜底）
-        检出绳子且未对准 → 覆盖走位方向继续微调；在grab阶段则打回重对位"""
+        """对准阶段：主画面绳子精调（小地图缩放误差兜底）。
+        v9 收紧：仅 align 阶段干预——grab 起跳后覆盖方向/打回对位
+        会造成空中横移、松开↑，正是“跳起来抓不到绳”的元凶；
+        玩家模板未检出时锚点=画面中心不可靠，同样不干预"""
+        if self.route_nav.phase != "align":
+            return
         if now - self._rope_t < 0.25:
             return
         self._rope_t = now
+        p = self._last_player
+        if p is None:
+            return
         ropes = self.rope_det.find(frame, self.cfg.get("detect_region"))
         if not ropes:
             return
-        best = min(ropes, key=lambda r: abs(r[0] - self._anchor_x(frame)))
-        dx = best[0] - self._anchor_x(frame)
+        best = min(ropes, key=lambda r: abs(r[0] - p[0]))
+        dx = best[0] - p[0]
         if abs(dx) > 28:
             cmd.dir = -1 if dx < 0 else 1
-            if self.route_nav.phase == "grab":
-                self.route_nav.back_to_align()
 
     def set_mode(self, mode):
         self.mode = mode
@@ -392,6 +397,9 @@ class BotEngine(threading.Thread):
         ax = anchor[0]
         # ---------- ① 战斗（巡逻模式限距追击，防脱线） ----------
         can_fight = (self._giveup_until is None or now > self._giveup_until)
+        # 爬绳全流程勿扰：战斗会松开↑（掉绳）并把角色拉离绳索
+        if can_fight and patrol_on and self.route_nav.phase != "none":
+            can_fight = False
         # 偏离路线检测：玩家点离最近标记太远 → 放弃战斗，2 秒防抖
         if can_fight and patrol_on and player_map is not None:
             off = self.route_nav.off_route_distance(player_map)
@@ -436,7 +444,7 @@ class BotEngine(threading.Thread):
             if cmd.stop:
                 self.move.release_all()
                 return cmd.status
-            if self.route_nav.phase in ("align", "grab"):
+            if self.route_nav.phase == "align":
                 self._rope_assist(frame, cmd, now)
             self.move.set_dir(cmd.dir)
             self.move.set_climb(cmd.climb)

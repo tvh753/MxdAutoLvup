@@ -107,6 +107,11 @@ class ColorRouteNavigator:
         self._retries = 0
         self._grab_jumped = False
         self._backoff_dir = 1
+        self._grab_jumped = False
+        self._backoff_dir = 1
+        self._jump_at = 0.0  # 起跳时刻（空中保护窗口）
+        self._phase_t = 0.0  # grab/climb 最近活跃时刻（定位丢失保护）
+        self._phase_way = None  # 当前爬绳方向
         # ---- 动作冷却 ----
         self._jump_t = 0.0
         self._tp_t = 0.0
@@ -231,8 +236,15 @@ class ColorRouteNavigator:
     def _reset_climb(self):
         self._phase, self._t0, self._y0, self._retries = "none", 0.0, None, 0
         self._grab_jumped = False
+        self._jump_at = 0.0
+        self._phase_t = 0.0
+        self._phase_way = None
 
     def back_to_align(self):
+        # 空中上升期禁止打断：外部误判会导致↑被松开、跳空
+        if self._phase == "grab" and self._grab_jumped \
+                and time.time() - self._jump_at < 0.6:
+            return
         if self._phase in ("grab", "climb"):
             self._phase = "align"
             self._retries += 1
@@ -462,6 +474,10 @@ class ColorRouteNavigator:
         if not self.ready:
             return RouteCmd(status="未加载颜色路线")
         if pos is None:
+            # 抓绳/攀爬中定位短暂丢失：保持↑按住别松（松开=掉绳）
+            if self._phase in ("grab", "climb") and now - self._phase_t < 2.5:
+                return RouteCmd(climb=self._phase_way,
+                                status="🪢 攀爬中(定位暂失)…")
             self._reset_climb()
             if self._probe is not None:
                 return RouteCmd(dir=self._probe_dir(), status="🔍 试探移动定位…")
@@ -620,6 +636,7 @@ class ColorRouteNavigator:
     def _climb(self, way, x, y, mx, now, nm):
         # —— 攀爬中：y 持续变化则按住，停滞超时交给下一标记 ——
         if self._phase == "climb":
+            self._phase_t, self._phase_way = now, way
             if now - self._move_t < 0.6:
                 self._t0 = now
                 return RouteCmd(climb=way, status=f"🪢 攀爬中[{nm}]")
@@ -633,23 +650,30 @@ class ColorRouteNavigator:
                 self._phase = "align"
                 return RouteCmd(dir=0, status="🪢 重新对位")
             return RouteCmd(dir=self._backoff_dir, status="🪢 退开重试")
-        # —— 抓绳确认：y 变化 ≥2 = 已上绳 ——
+        # —— 抓绳确认 ——
         if self._phase == "grab":
-            if self._y0 is not None and abs(y - self._y0) >= 2:
+            self._phase_t, self._phase_way = now, way
+            # 已上绳：y 高于起点≥2px 且排除起跳弧线（没抓住会落回 y≈y0）
+            if self._y0 is not None and y < self._y0 - 2 and \
+                    (not self._grab_jumped or now - self._jump_at > 0.5):
                 self._phase, self._t0 = "climb", now
                 return RouteCmd(climb=way, status="🪢 已上绳")
-            if now - self._t0 > 0.9:
+            if now - self._t0 > 1.6:
                 self._retries += 1
-                if self._retries >= 4:
+                if self._retries >= 6:
                     self._reset_climb()
                     return RouteCmd(status="⚠ 抓绳多次失败，暂停该动作")
                 self._backoff_dir = 1 if self._retries % 2 else -1
                 self._phase, self._t0 = "backoff", now
                 return RouteCmd(dir=0, status="🪢 抓绳未果，退开重试")
-            # 停稳 0.15s 后原地起跳抓绳（只跳一次）；下绳则直接按住↓挂绳
             if way == "up":
-                if not self._grab_jumped and now - self._t0 >= 0.15:
+                if not self._grab_jumped:
+                    # 先按住↑ 0.5s：站在绳底直接吸附，多数情况无需跳
+                    if now - self._t0 < 0.5:
+                        return RouteCmd(dir=0, climb="up",
+                                        status="🪢 按住↑探测绳底…")
                     self._grab_jumped = True
+                    self._jump_at = now
                     return RouteCmd(dir=0, climb="up", jump=True,
                                     status="🦘+🪢 原地跳抓绳")
                 return RouteCmd(dir=0, climb="up", status="🪢 抓绳中…")
@@ -659,9 +683,10 @@ class ColorRouteNavigator:
             self._phase = "align"
             return RouteCmd(dir=1 if mx > x else -1,
                             status=f"🪢 对准绳子…[{nm}]")
-        # —— 到位：先停步再抓（带横移速度起跳容易冲过绳子） ——
+        # —— 到位：先停步再抓 ——
         self._phase, self._t0, self._y0, self._grab_jumped = "grab", now, y, False
         return RouteCmd(dir=0, status="🪢 停步准备抓绳")
+
 
     def set_base(self, base_bgr):
         """注入录制时的小地图底图（滚动补偿基准）"""
