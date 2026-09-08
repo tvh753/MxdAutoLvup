@@ -19,36 +19,43 @@ from core.config_manager import deep_merge
 
 
 class MapManager:
+    """地图包管理器：把「小地图底图 + 颜色路线 + 怪物模板」整体打包/恢复"""
+
     def __init__(self, root):
-        self.maps_dir = os.path.join(root, "maps")
-        self.player_dir = os.path.join(root, "templates", "player")
+        self.maps_dir = os.path.join(root, "maps")        # 地图包根目录
+        self.player_dir = os.path.join(root, "templates", "player")  # 玩家模板全局目录
         os.makedirs(self.maps_dir, exist_ok=True)
         os.makedirs(self.player_dir, exist_ok=True)
         self.player_path = os.path.join(self.player_dir, "player.png")
 
     # ---------------- 基础 ----------------
     def list_maps(self):
+        """返回所有已保存的地图包名（升序）"""
         if not os.path.isdir(self.maps_dir):
             return []
         return sorted(d for d in os.listdir(self.maps_dir)
                       if os.path.isdir(os.path.join(self.maps_dir, d)))
 
     def _path(self, name, *parts):
+        """拼出地图包内文件路径：maps/<name>/<parts...>"""
         return os.path.join(self.maps_dir, name, *parts)
 
     @staticmethod
     def _safe_name(name):
+        """清洗文件名字符（去掉 Windows 非法字符），最长 24 字符"""
         keep = [c for c in str(name) if c not in r'\/:*?"<>|']
         return ("".join(keep).strip() or "怪物")[:24]
 
     @staticmethod
     def _in_dir(path, d):
+        """判断 path 是否位于目录 d 内（路径归一化后前缀比较）"""
         p = os.path.normcase(os.path.abspath(path))
         dd = os.path.normcase(os.path.abspath(d))
         return p.startswith(dd + os.sep)
 
     # ---------------- 玩家模板（全局单独存放） ----------------
     def save_player(self, img):
+        """把玩家模板写入全局位置，返回写入路径"""
         if img is None:
             return None
         if not imwrite_u(self.player_path, img):
@@ -56,6 +63,7 @@ class MapManager:
         return self.player_path
 
     def player_exists(self):
+        """全局玩家模板是否已存在"""
         return os.path.isfile(self.player_path)
 
     # ---------------- 怪物模板（地图绑定） ----------------
@@ -72,6 +80,7 @@ class MapManager:
         return p
 
     def list_monsters(self, map_name):
+        """列出地图包内的怪物模板文件名"""
         d = self._path(map_name, "monsters")
         if not os.path.isdir(d):
             return []
@@ -79,7 +88,16 @@ class MapManager:
 
     # ---------------- 保存地图包 ----------------
     def save(self, name, cfg, minimap_img, route_img, grab_fn=None):
-        """grab_fn：现场截图回调（返回整帧 BGR 或 None），用于底图自动补拍"""
+        """把当前配置 + 底图 + 路线 + 怪物模板打包成地图包
+
+        参数：
+            name        —— 地图包名（即目录名）
+            cfg         —— 当前配置（怪物模板、小地图区域、按键等快照）
+            minimap_img —— 小地图底图；None 时若已校准小地图区域则现场补拍
+            route_img   —— 颜色路线图；None 则保留包内旧路线（重存不洗掉）
+            grab_fn     —— 现场截图回调（返回整帧 BGR 或 None），用于底图自动补拍
+        返回：写入的 profile 配置（已同步 monster_templates 到包内路径）
+        """
         d = self._path(name)
         pack_mon_dir = os.path.join(d, "monsters")
         os.makedirs(pack_mon_dir, exist_ok=True)
@@ -153,6 +171,14 @@ class MapManager:
 
     # ---------------- 加载地图包 ----------------
     def load(self, name, cfg):
+        """加载地图包：把 profile.json 合并进当前配置，返回 (成功?, 缺失文件清单)
+
+        处理内容：
+          1. 读取 profile.json，覆盖 cfg 中的窗口/按键/区域/怪物模板等；
+          2. 旧版包内玩家模板 → 迁移到全局（一次性、幂等）；
+          3. 全局玩家模板存在 → 恢复引用；
+          4. 校验包内关键文件（路线图/底图/怪物模板），返回缺失清单。
+        """
         pfile = self._path(name, "profile.json")
         if not os.path.exists(pfile):
             return False, []
@@ -194,19 +220,24 @@ class MapManager:
 
     # ---------------- 图片存取（imio 中文路径安全） ----------------
     def load_minimap(self, name):
+        """读取地图包的小地图底图（中文路径安全）"""
         return imread_u(self._path(name, "minimap.png"))
 
     def load_route(self, name):
+        """读取地图包的颜色路线图"""
         return imread_u(self._path(name, "route.png"))
 
     def save_minimap(self, name, img):
+        """写入小地图底图，成功返回 True"""
         return img is not None and imwrite_u(self._path(name, "minimap.png"), img)
 
     def save_route(self, name, route_img):
+        """写入颜色路线图，成功返回 True"""
         return route_img is not None and \
             imwrite_u(self._path(name, "route.png"), route_img)
 
     def delete(self, name):
+        """删除整个地图包目录（真删除，谨慎调用）"""
         d = self._path(name)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)

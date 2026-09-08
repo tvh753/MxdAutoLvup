@@ -4,7 +4,18 @@
 # @File    : route_painter.py
 # @Software: MxdAutoLvup
 
-"""颜色路线绘制器 v2：自由绘制 + 按住Shift拖动画直线（可吸附水平/垂直）"""
+"""颜色路线绘制器 v2：自由绘制 + 按住Shift拖动画直线（可吸附水平/垂直）
+
+作用：在「录制的小地图底图」上，用 14 种动作颜色画出巡逻路线。
+画完保存的 route.png 由 color_route.ColorRouteNavigator 加载并
+逐像素解析成动作指令（见 core/color_route.py 的 RAW_CODES）。
+
+交互：
+  - 左键拖拽 = 自由绘制当前颜色；
+  - 按住 Shift 拖拽 = 画直线（可选吸附水平/垂直）；
+  - 右键 = 撤销上一笔；橡皮擦 = 画黑色（底色）；
+  - 返回：BGR 的 route 图像（透明标记用黑色底色区分）。
+"""
 import math
 import tkinter as tk
 import numpy as np
@@ -18,6 +29,7 @@ SNAP_DEG = 12.0  # 吸附角度容差：与横/竖夹角小于此值即吸附
 
 
 class RoutePainter(tk.Toplevel):
+    """颜色路线绘制器（模态窗口），负责把颜色路线画到小地图底图上"""
     PEN_SIZES = [("细", 1), ("中", 2), ("粗", 4)]
 
     def __init__(self, master, base_bgr, route_bgr=None, on_ok=None):
@@ -112,6 +124,7 @@ class RoutePainter(tk.Toplevel):
 
     # ---------- 色板 ----------
     def _pick(self, swatch, bgr_color):
+        """选中色板：切换当前绘制颜色（None = 橡皮擦），高亮当前色板"""
         self._color = bgr_color
         if self._cur_sw is not None:
             self._cur_sw.config(highlightbackground=BORDER)
@@ -120,14 +133,16 @@ class RoutePainter(tk.Toplevel):
 
     # ---------- 坐标/渲染 ----------
     def _to_orig(self, cx, cy):
+        """画布坐标 → 底图原图坐标"""
         return (int(cx / self.scale), int(cy / self.scale))
 
     def _stroke_color(self):
         return self._color if self._color else (0, 0, 0)  # 橡皮=黑(底色)
 
     def _render(self):
+        """把「底图 + 已画路线」合成预览图并贴到画布"""
         show = self._base.copy()
-        nz = self.route.max(2) > 40
+        nz = self.route.max(2) > 40   # 只叠加「非黑」的路线像素
         show[nz] = self.route[nz]
         img = cv2.cvtColor(show, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (self.cw, self.ch),
@@ -138,12 +153,14 @@ class RoutePainter(tk.Toplevel):
 
     # ---------- 自由绘制 ----------
     def _down(self, e):
+        """按下：落一个点开始自由绘制"""
         p = self._to_orig(e.x, e.y)
         cv2.circle(self.route, p, self._pen_w // 2 + 1, self._stroke_color(), -1)
         self._drawing = [p]
         self._render()
 
     def _drag(self, e):
+        """拖动：直线模式从快照重画（实时预览），自由模式连线段"""
         # —— 直线模式：从起笔快照恢复 → 画起点→当前点直线（实时预览） ——
         if self._line_start is not None:
             end = self._to_orig(e.x, e.y)
@@ -167,6 +184,7 @@ class RoutePainter(tk.Toplevel):
         self._render()
 
     def _up(self, _):
+        """松开：把本次笔画（自由点列 / 直线两端）压入撤销栈"""
         # 直线收笔：以 [起点, 终点] 入撤销栈
         if self._line_start is not None:
             self._strokes.append((self._stroke_color(),
@@ -183,6 +201,7 @@ class RoutePainter(tk.Toplevel):
 
     # ---------- 直线模式起笔 ----------
     def _down_line(self, e):
+        """按住 Shift 按下：进入直线模式，记录起点与起笔前快照"""
         self._drawing = None
         self._line_start = self._to_orig(e.x, e.y)
         self._line_end = None
@@ -206,6 +225,7 @@ class RoutePainter(tk.Toplevel):
 
     # ---------- 撤销/清空 ----------
     def _undo(self):
+        """撤销上一笔：重放剩余笔画（直线=两点连线，天然兼容）"""
         if not self._strokes:
             return
         self._strokes.pop()
@@ -217,13 +237,15 @@ class RoutePainter(tk.Toplevel):
         self._render()
 
     def _clear(self):
+        """清空全部笔画"""
         self._strokes = []
         self.route[:, :] = 0
         self._render()
 
     def _ok(self):
+        """保存：把 route 图像经 on_ok 回调返回给调用方"""
         if not self._strokes and self.route.max() == 0:
-            return
+            return  # 什么都没画，忽略
         cb, self.on_ok = self.on_ok, None
         result = self.route.copy()
         self.destroy()

@@ -4,18 +4,25 @@
 # @File    : theme.py
 # @Software: MxdAutoLvup
 
-"""深色游戏风主题"""
-BG      = "#0f1117"   # 全局背景
-PANEL   = "#171a24"   # 一级面板
-PANEL_2 = "#1e2230"   # 二级面板/输入
-BORDER  = "#2a2f42"
-TEXT    = "#e8eaf2"
-TEXT_DIM= "#8b90a5"
-ACCENT  = "#ffb020"   # 金色主强调
-ACCENT_2= "#7dd3fc"
-HP      = "#ff5262"
-MP      = "#4db8ff"
-GREEN   = "#3ddc84"
-RED     = "#ff5252"
-FONT    = "Microsoft YaHei UI"
-MONO    = "Consolas"
+"""深色游戏风主题 —— 全局颜色 / 字体常量
+
+所有 GUI 模块统一从这里取值，避免在界面代码里散落魔法色值；
+想整体换主题（如改成浅色）只需修改本文件。
+"""
+BG      = "#0f1117"   # 全局背景（最外层深色）
+PANEL   = "#171a24"   # 一级面板（卡片 / 侧栏底色）
+PANEL_2 = "#1e2230"   # 二级面板 / 输入框底色（比一级稍亮，用于层次区分）
+BORDER  = "#2a2f42"   # 边框线颜色
+TEXT    = "#e8eaf2"   # 主文字（近白，保证深底可读）
+TEXT_DIM= "#8b90a5"   # 次要 / 提示文字（灰色）
+ACCENT  = "#ffb020"   # 金色主强调（选中态 / 高亮 / 标题）
+ACCENT_2= "#7dd3fc"   # 天蓝辅助强调（按键捕获态等）
+HP      = "#ff5262"   # 生命条（红）
+MP      = "#4db8ff"   # 魔法条（蓝）
+GREEN   = "#3ddc84"   # 成功 / 运行中（绿）
+RED     = "#ff5252"   # 危险 / 停止（红）
+FONT    = "Microsoft YaHei UI"   # 界面主字体（微软雅黑，中文显示友好）
+
+
+
+MONO    = "Consolas"              # 等宽字体（数字 / 日志，对齐美观）

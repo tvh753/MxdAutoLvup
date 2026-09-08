@@ -32,6 +32,14 @@ EMA_ALPHA = 0.35  # 平滑系数：越大越灵敏、越易跳变
 
 
 class BarMonitor:
+    """单一状态条（HP/MP/EXP）的识别器
+
+    使用方式：
+      1. GUI 框选状态条区域后 set(region=...)；
+      2. 满状态时可选 calibrate_color() 微调识别色相区间（应对皮肤/滤镜）；
+      3. 引擎每帧调用 percentage(frame) 获取 0~100 的填充百分比。
+    识别管线见模块 docstring。
+    """
     def __init__(self, kind="hp", region=(0, 0, 0, 0)):
         self.kind = kind
         self.region = tuple(int(v) for v in region)

@@ -4,7 +4,15 @@
 # @File    : route_editor.py
 # @Software: MxdAutoLvup
 
-"""巡逻路线编辑器 v2：行走 / 跳跃 / 绳索路点"""
+"""巡逻路线编辑器 v2：行走 / 跳跃 / 绳索路点
+
+【已废弃参考实现】引擎已切换到「颜色路线绘制器」（route_painter.py
++ color_route.py 像素级寻路），本编辑器对应的路点式巡逻（patrol.py）
+不再启用。保留便于对比学习两种路线定义方式。
+
+用法：选路点类型 → 左键按顺序布点（右键撤销）→ 保存
+返回 {"waypoints": [[x,y,action],...], "mode": "pingpong"/"loop"}
+"""
 import tkinter as tk
 import numpy as np
 from PIL import Image, ImageTk
@@ -19,6 +27,7 @@ STYLE = {WALK: ("🚶", "#ffb020"), JUMP: ("🦘", "#50c8ff"),
 
 
 class RouteEditor(tk.Toplevel):
+    """路点式路线编辑器（模态窗口）"""
     TYPES = [(WALK, "🚶 行走"), (JUMP, "🦘 跳跃"),
              (ROPE_UP, "🪢 绳上爬"), (ROPE_DOWN, "🪢 绳下滑")]
     MODES = [("pingpong", "往返"), ("loop", "循环")]
@@ -94,21 +103,25 @@ class RouteEditor(tk.Toplevel):
 
     @staticmethod
     def _norm(w):
+        """路点规范化：[x, y] → [x, y, WALK]，非法动作归为 WALK"""
         x, y = int(w[0]), int(w[1])
         act = w[2] if len(w) > 2 and w[2] in STYLE else WALK
         return [x, y, act]
 
     def _add(self, e):
+        """左键添加一个当前类型路点（画布坐标 → 原图坐标）"""
         self.pts.append([int(e.x / self.scale), int(e.y / self.scale),
                          self._type_var.get()])
         self._redraw()
 
     def _undo(self, _=None):
+        """右键/按钮撤销最后一个路点"""
         if self.pts:
             self.pts.pop()
         self._redraw()
 
     def _redraw(self):
+        """全量重绘：连线 + 路点圆标 + 序号图标 + 计数"""
         self.canvas.delete("route")
         for i, (x, y, act) in enumerate(self.pts):
             icon, color = STYLE.get(act, STYLE[WALK])

@@ -11,3 +11,4 @@
 /templates/
 /venv/
 /config.json
+test*

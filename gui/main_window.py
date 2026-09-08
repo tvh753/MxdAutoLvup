@@ -4,7 +4,28 @@
 # @File    : main_window.py
 # @Software: MxdAutoLvup
 
-"""枫叶挂机控制台 · 主界面"""
+"""枫叶挂机控制台 · 主界面（App 类，tkinter 单窗口）
+
+布局概览：
+  ┌──────────────────────────────────────────────────┐
+  │  标题栏 · 状态胶囊（待机/监控/运行/暂停）           │
+  ├──────────────────────────┬───────────────────────┤
+  │ 左侧 Notebook 三页签      │ 右侧：实时识别预览画面  │
+  │  🎯 目标   ⌨ 按键   ⚙ 参数│      HP/MP/EXP 进度条  │
+  │  底部：启动/停止/暂停按钮  │      FPS/目标/动作/模式 │
+  │                          │      运行日志          │
+  └──────────────────────────┴───────────────────────┘
+
+线程模型（关键！）：
+  tkinter 主线程（本类）只负责界面刷新与事件回调；
+  引擎 BotEngine 是独立后台线程。
+  数据单向流动：引擎 →(queue)→ GUI（预览帧 / 日志），
+  GUI →(方法调用)→ 引擎（配置 / 模式切换）。
+  因此界面永远流畅，不会因为截图/识别耗时而卡住。
+
+刷新机制：after() 轮询（80ms 状态 + 250ms 日志），
+不阻塞主循环，两个队列空了立即返回。
+"""
 import os, time, queue
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
@@ -24,8 +45,14 @@ from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
 from core.imio import imwrite_u
 
 class App(tk.Tk):
-    PREVIEW_W, PREVIEW_H = 760, 430
-    KEY_ROWS = [
+    """枫叶挂机控制台主窗口（tk.Tk 单例）
+
+    职责：组织界面 → 转发用户操作到引擎 → 轮询刷新引擎状态。
+    状态来源全部是 self.engine.status 与 self.engine.preview_queue，
+    不做任何重复识别计算。
+    """
+    PREVIEW_W, PREVIEW_H = 760, 430  # 预览画布尺寸（px）
+    KEY_ROWS = [  # 按键页签：显示名 ↔ config["keys"] 的键名
         ("普通攻击", "attack"), ("技能1", "skill1"), ("技能2", "skill2"), ("技能3", "skill3"),
         ("红药", "hp_potion"), ("蓝药", "mp_potion"), ("拾取", "pickup"),
         ("左移", "move_left"), ("右移", "move_right"), ("跳跃", "jump"),
@@ -39,23 +66,25 @@ class App(tk.Tk):
         self.geometry("1280x800")
         self.minsize(1180, 740)
 
+        # 配置（ConfigManager 持有 cfg 引用，GUI/引擎共用同一份）
         self.cfg_mgr = ConfigManager()
         self.cfg = self.cfg_mgr.cfg
-        self.log_queue = queue.Queue()
-        self._pv_photo = None
-        self._pill_state = None
+        self.log_queue = queue.Queue()      # GUI 侧日志队列
+        self._pv_photo = None               # 预览图缓存（防被 GC 回收）
+        self._pill_state = None             # 状态胶囊缓存（变化才重绘）
 
+        # 引擎：日志回调包装成 (时间戳, 消息, 级别) 入队，GUI 轮询取出
         self.engine = BotEngine(self.cfg, lambda m, lv="info": self.log_queue.put(
             (time.strftime("%H:%M:%S"), m, lv)))
         self.maps = MapManager(ROOT)
         self._minimap_snap = None  # 当前小地图底图（录制）
         self._route_img = None  # 当前颜色路线层
-        self.engine.start()
+        self.engine.start()  # 后台线程立刻启动（IDLE 模式空转等待）
 
         self._build_style()
         self._build_layout()
-        self._poll_status()
-        self._poll_log()
+        self._poll_status()   # 启动状态轮询
+        self._poll_log()      # 启动日志轮询
         self.bind("<F8>", self.toggle_run)
         self.bind("<F9>", self.toggle_pause)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -271,6 +300,33 @@ class App(tk.Tk):
                  fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).grid(
             row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        # v20: 攻击方式选择（普攻 / 技能随机）
+        box2, body2 = self._section(tab, "⚔ 攻击方式")
+        box2.pack(fill="x", padx=8, pady=(0, 8))
+        row = tk.Frame(body2, bg=PANEL_2)
+        row.pack(fill="x")
+        tk.Label(row, text="攻击方式", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=8, anchor="w").pack(side="left")
+        self.attack_mode_var = tk.StringVar(
+            value=self.cfg["keys"].get("attack_mode", "normal"))
+        self.attack_mode_combo = ttk.Combobox(
+            row, state="readonly", width=12,
+            values=("普通攻击", "技能1-3随机"),
+            textvariable=self.attack_mode_var)
+        self.attack_mode_combo.pack(side="left")
+        # 显示值→实际值映射
+        self.attack_mode_map = {"普通攻击": "normal", "技能1-3随机": "skill"}
+        self.attack_mode_var.set(
+            "普通攻击" if self.attack_mode_var.get() == "normal" else "技能1-3随机")
+        self.attack_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: (self.cfg["keys"].__setitem__(
+                "attack_mode", self.attack_mode_map.get(
+                    self.attack_mode_var.get(), "normal")),
+                self.cfg_mgr.save()))
+        tk.Label(body2, text="选「普通攻击」使用攻击键；选「技能1-3随机」从已配置的技能键中随机选用",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(4, 0))
+
     def _build_param_tab(self, tab):
         box, body = self._section(tab, "🎚 识别与策略参数")
         box.pack(fill="x", padx=8, pady=8)
@@ -429,6 +485,7 @@ class App(tk.Tk):
 
     # ================= 业务动作 =================
     def refresh_windows(self):
+        """刷新窗口下拉列表，并默认选中上次绑定的窗口"""
         self.win_combo["values"] = [t for t, _ in WindowCapture.list_windows()]
         saved = self.cfg.get("window_title", "")
         for i, t in enumerate(self.win_combo["values"]):
@@ -437,6 +494,7 @@ class App(tk.Tk):
                 break
 
     def bind_window(self):
+        """绑定所选游戏窗口 → 进入预览监控模式"""
         title = self.win_combo.get()
         if not title:
             messagebox.showwarning("提示", "请先选择游戏窗口", parent=self)
@@ -452,6 +510,7 @@ class App(tk.Tk):
             self.log("窗口绑定失败", "error")
 
     def _grab_frame(self):
+        """取一帧画面：优先实时截图（框选/录制需要当前画面），失败回退引擎缓存帧"""
         if not self.engine.window_bound():
             messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self)
             return None
@@ -464,6 +523,7 @@ class App(tk.Tk):
         return frame
 
     def add_monster_template(self):
+        """框选怪物本体 → 命名 → 存进地图包（或公共暂存区）→ 热重载"""
         frame = self._grab_frame()
         if frame is None:
             return
@@ -569,6 +629,7 @@ class App(tk.Tk):
             fg=TEXT if pt else TEXT_DIM)
 
     def calibrate_bar(self, which):
+        """校准 HP/MP/EXP 状态条：框选区域 + 引擎自动适配颜色"""
         frame = self._grab_frame()
         if frame is None:
             return
@@ -587,6 +648,7 @@ class App(tk.Tk):
                        tip="请在满血/满蓝状态下完整框选整条（红=HP 蓝=MP 黄=EXP，含空槽部分）")
 
     def calibrate_region(self):
+        """框选检测区域（缩小搜索范围提速），None=全屏"""
         frame = self._grab_frame()
         if frame is None:
             return
@@ -601,9 +663,11 @@ class App(tk.Tk):
 
     # ---------- 巡逻路线 ----------
     def _patrol_cfg(self):
+        """patrol 配置节（不存在则自动补默认空字典）"""
         return self.cfg.setdefault("patrol", {})
 
     def calibrate_minimap(self):
+        """校准小地图：框选地图区域 → 多帧采样玩家黄点颜色 → 顺手录制底图"""
         frame = self._grab_frame()
         if frame is None:
             return
@@ -641,6 +705,7 @@ class App(tk.Tk):
             self.maps_combo.current(0)
 
     def record_minimap(self):
+        """录制小地图底图：裁剪当前帧 → 存入 _minimap_snap → 注入引擎滚动补偿"""
         mm = self.cfg.get("patrol", {}).get("minimap", {})
         if mm.get("w", 0) < 5:
             messagebox.showwarning("提示", "请先「校准小地图」", parent=self)
@@ -664,6 +729,7 @@ class App(tk.Tk):
             self.log(f"小地图底图已录制 ({mm['w']}×{mm['h']})，可「绘制颜色路线」", "ok")
 
     def paint_route(self):
+        """打开颜色路线绘制器：绘制完成后直接加载到引擎（有地图包则落盘）"""
         if self._minimap_snap is None:  # 尝试从当前地图包取底图
             name = self.cfg.get("patrol", {}).get("current_map", "")
             if name:
@@ -692,6 +758,7 @@ class App(tk.Tk):
         RoutePainter(self, self._minimap_snap, self._route_img, on_ok=ok)
 
     def save_map_pack(self):
+        """把「配置 + 底图 + 颜色路线 + 怪物模板」整体保存成地图包"""
         name = self.maps_combo.get().strip()
         if not name:
             name = (simpledialog.askstring("地图包命名", "地图名称（如：蘑菇山）：",
@@ -739,6 +806,7 @@ class App(tk.Tk):
                  f"路线{'✓' if self._route_img is not None else '✗'}，巡逻已启用", "ok")
 
     def load_map_pack(self):
+        """加载地图包：恢复该地图全部配置并同步 UI 控件，缺底图自动补拍"""
         name = self.maps_combo.get()
         if not name:
             messagebox.showwarning("提示", "请先选择地图包", parent=self)
@@ -843,12 +911,14 @@ class App(tk.Tk):
         self.log("检测区域已恢复全屏", "info")
 
     def _set_key(self, key, value):
+        """按键捕获回调：写入 config 并保存（空值 = 清空该按键）"""
         v = "" if (not value or value == "-") else value
         self.cfg["keys"][key] = v
         self.cfg_mgr.save()
         self.log(f"按键 [{key}] → {v or '(空)'}", "info")
 
     def start_bot(self, _e=None):
+        """▶ 启动挂机：前置校验（绑定窗口/怪物模板）→ 引擎切到 RUNNING"""
         if not self.engine.window_bound():
             messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self);
             return
@@ -865,13 +935,16 @@ class App(tk.Tk):
         self.log("🚀 挂机启动！按键将发送到游戏窗口，请勿最小化游戏", "ok")
 
     def stop_bot(self, _e=None):
+        """⏹ 停止：回到预览监控（保持识别不按键）"""
         self.engine.set_mode(Mode.PREVIEW)
         self.log("⏹ 已停止战斗，保持监控", "warn")
 
     def toggle_run(self, _e=None):
+        """F8：运行 ⇄ 停止"""
         self.stop_bot() if self.engine.mode == Mode.RUNNING else self.start_bot()
 
     def toggle_pause(self, _e=None):
+        """F9：运行 ⇄ 暂停（暂停只停按键，继续监控）"""
         if self.engine.mode == Mode.RUNNING:
             self.engine.set_mode(Mode.PAUSED);
             self.log("已暂停", "warn")
@@ -880,10 +953,12 @@ class App(tk.Tk):
             self.log("恢复运行", "ok")
 
     def log(self, msg, lv="info"):
+        """向日志队列推一条日志（引擎线程/GUI 线程共用）"""
         self.log_queue.put((time.strftime("%H:%M:%S"), msg, lv))
 
     # ================= 轮询刷新 =================
     def _poll_status(self):
+        """状态轮询（每 80ms）：拉预览帧 → 刷新进度条/状态胶囊/信息标签"""
         ann = None
         try:
             ann = self.engine.preview_queue.get_nowait()
@@ -914,6 +989,7 @@ class App(tk.Tk):
         self.after(80, self._poll_status)
 
     def _show_preview(self, ann):
+        """把引擎的标注帧等比缩放到预览画布上显示"""
         img = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
         s = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
@@ -927,6 +1003,7 @@ class App(tk.Tk):
                        anchor="nw", image=self._pv_photo)
 
     def _poll_log(self):
+        """日志轮询（每 250ms）：把队列里的日志增量写入日志框"""
         changed = False
         while True:
             try:
@@ -943,6 +1020,7 @@ class App(tk.Tk):
         self.after(250, self._poll_log)
 
     def _on_close(self):
+        """关窗：先停引擎线程并保存配置，再销毁窗口"""
         self.engine.shutdown()
         self.cfg_mgr.save()
         self.destroy()
