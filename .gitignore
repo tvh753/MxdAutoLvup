@@ -12,3 +12,5 @@
 /venv/
 /config.json
 test*
+/dist/
+/打包指南.md
