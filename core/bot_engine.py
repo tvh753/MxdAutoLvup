@@ -11,6 +11,7 @@ import queue
 import cv2
 import os
 import random
+import datetime as _dt
 import numpy as np
 
 from core.window_capture import WindowCapture
@@ -90,6 +91,14 @@ class BotEngine(threading.Thread):
         self._rest_until = 0.0
         self._sess_end = None
         self._grace_until = None
+        self._rest_rope = None  # 休息目标绳子 (top_y, bottom_y, cx)
+        self._rest_status = ""  # 走向绳子时的状态文本
+        # 定时下线/上线状态
+        self._logged_out = False  # 是否已下线
+        self._logout_deadline = None  # 下线截止时间戳
+        self._login_deadline = None  # 上线截止时间戳
+        self._logout_done_today = None  # 今天已下线的日期，避免重复
+        self._login_done_today = None  # 今天已上线的日期
 
     # ============ 对外接口 ============
     def bind_window(self, keyword) -> bool:
@@ -187,6 +196,12 @@ class BotEngine(threading.Thread):
             search_range=p.get("search_range", 10),
             grab_tol=p.get("grab_tol", 4),
             dot_max_area=p.get("dot_max_area", 40),
+            # 爬绳停稳后的容错缓冲时间（秒）：玩家在小地图停止移动后，
+            # 再等此时长才脱离绳子，确保角色完全停稳。可在 patrol.climb_grace 配置，默认 3.0
+            climb_grace=p.get("climb_grace", 3.0),
+            # 脱离绳子时按↑的持续时间（秒）：到达绳子顶端后按↑此时长确保脱离。
+            # 可在 patrol.detach_time 配置，默认 2.0
+            detach_time=p.get("detach_time", 2.0),
         )
 
         rp = p.get("route_path", "")
@@ -287,7 +302,8 @@ class BotEngine(threading.Thread):
                 try:
                     self._tick()
                 except Exception as e:
-                    self.log(f"引擎异常: {e}", "error")
+                    import traceback
+                    self.log(f"引擎异常: {e}\n{traceback.format_exc()}", "error")
                     self.move.release_all()
                     time.sleep(0.5)
                 time.sleep(0.004)
@@ -344,13 +360,24 @@ class BotEngine(threading.Thread):
         self._last_map_pos = player_map
         self._draw_patrol(ann, player_map)
 
-        # ④ 决策（含定时休息调度）
+        # ④ 决策（含定时休息调度、定时下线/上线）
         if self.mode == Mode.RUNNING:
-            resting = self._schedule_tick(now)
-            if resting:
-                self.move.release_all()
-                remain = max(0.0, self._rest_until - now)
-                st["action"] = f"😴 休息中 剩{int(remain // 60)}分{int(remain % 60):02d}秒"
+            # 定时下线/上线优先（下线期间跳过所有战斗与休息）
+            in_out_proc = self._logout_login_tick(now)
+            resting = self._schedule_tick(now) if not in_out_proc else False
+            if in_out_proc:
+                if self._logged_out:
+                    st["action"] = "🚪 已下线，等待定时上线…"
+                else:
+                    st["action"] = "⏳ 下线/上线流程中…"
+            elif resting:
+                if self._resting:
+                    self.move.release_all()
+                    remain = max(0.0, self._rest_until - now)
+                    st["action"] = f"😴 休息中 剩{int(remain // 60)}分{int(remain % 60):02d}秒"
+                else:
+                    # 走向安全点(绳子)中，移动指令已在 _schedule_tick 执行
+                    st["action"] = f"🧗 {getattr(self, '_rest_status', '走向安全点…')}"
             elif focused:
                 st["action"] = self._decide(frame, monsters, player, player_map)
                 if self._grace_until and now < self._grace_until:
@@ -374,8 +401,19 @@ class BotEngine(threading.Thread):
             self.log("游戏窗口失焦，暂停按键输出（点回游戏窗口自动恢复）", "warn")
         return False
 
+    def _thresholds(self):
+        """返回阈值字典的数值归一化副本，防止配置中字符串类型导致算术异常。"""
+        raw = self.cfg.get("thresholds", {}) or {}
+        out = {}
+        for k, v in raw.items():
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                out[k] = v
+        return out
+
     def _auto_potion(self, hp, mp):
-        keys, th = self.cfg["keys"], self.cfg["thresholds"]
+        keys, th = self.cfg["keys"], self._thresholds()
         if 0 <= hp <= th["hp_potion"] and self.controller.cooldown_ok("hp", th["potion_cooldown"]):
             self.controller.tap(keys.get("hp_potion"))
             self.log(f"❤ HP {hp:.0f}% → 喝红药", "info")
@@ -405,10 +443,12 @@ class BotEngine(threading.Thread):
             x, y = rx, ry
 
         monsters, player = [], None
+        # 怪物匹配阈值从配置读取（thresholds.match），玩家模板固定0.85
+        match_sim = float(self._thresholds().get("match", 0.90))
+        gray = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
         if self.detector.templates:
             # v15: 灰度图转换只做一次，所有模板共享
-            gray = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
-            for name in self.detector.templates:
+            for name in list(self.detector.templates):
                 hits = self.detector.find_all(name, th, scene_gray=gray, offset=(x, y))
                 if not hits:
                     continue
@@ -419,6 +459,50 @@ class BotEngine(threading.Thread):
                     for h in hits:
                         monsters.append((h, name))
                         self._last_boxes.append((*self._box_of(h), (60, 100, 255), name[:10]))
+
+        # # v21: 用 list() 拷贝模板名列表 + try/except，避免 GUI 线程
+        # # reload_runtime 时 "dictionary changed size during iteration" 报错
+        # gray = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
+        # if list(self.detector.templates):
+        #     # ============================================================
+        #     # 玩家模板 → find_pic（彩色 TM_CCORR_NORMED 匹配）
+        #     # 玩家只有一个，用 find_pic 取最佳匹配即可，速度更快且
+        #     # 彩色匹配对玩家角色的服饰/肤色特征更敏感，定位更准。
+        #     # 阈值固定 0.85，略低于怪物阈值以提高检出率。
+        #     # ============================================================
+        #     if self._player_tpl and self._player_tpl in self.detector.templates:
+        #         try:
+        #             player_hits = self.detector.find_all(
+        #                 self._player_tpl, threshold=0.8, scene_gray=gray, offset=(x, y))
+        #             if player_hits:
+        #                 player = player_hits[0]
+        #                 self._last_boxes.append(
+        #                     (*self._box_of(player_hits[0]), (90, 255, 90), "PLAYER"))
+        #         except Exception as e:
+        #             self.log(f"玩家模板 find_pic 异常: {e}", "warn")
+        #
+        #     # ============================================================
+        #     # 怪物模板 → find_all（灰度 TM_CCOEFF_NORMED + NMS）
+        #     # 怪物可能同时出现多个，必须用 find_all 返回全部命中点，
+        #     # 再经 NMS 去重。阈值来自配置 thresholds.match。
+        #     # 灰度图只转一次，所有怪物模板共享，省 CPU。
+        #     # ============================================================
+        #
+        #     for name in list(self.detector.templates):
+        #         if name == self._player_tpl:
+        #             continue  # 玩家已用 find_pic 处理，此处跳过
+        #         try:
+        #             hits = self.detector.find_all(
+        #                 name, threshold=match_sim, scene_gray=gray, offset=(x, y))
+        #         except Exception as e:
+        #             self.log(f"怪物模板[{name}] find_all 异常: {e}", "warn")
+        #             continue
+        #         if not hits:
+        #             continue
+        #         for h in hits:
+        #             monsters.append((h, name))
+        #             self._last_boxes.append(
+        #                 (*self._box_of(h), (60, 100, 255), name[:10]))
 
         # v16: 名牌检测作为玩家位置补充（参考项目 get_player_location_by_nametag）
         if player is None:
@@ -514,7 +598,7 @@ class BotEngine(threading.Thread):
             return False  # 面朝左但怪在右边 → 背后
         # 高度判定: 同平台判定（如果传了ay）
         if ay is not None:
-            tol = self.cfg.get("thresholds", {}).get("front_height_tol", 60)
+            tol = self._thresholds().get("front_height_tol", 60)
             if abs(my - ay) > tol:
                 return False  # 高度差太大 → 不同平台
         return True
@@ -529,7 +613,7 @@ class BotEngine(threading.Thread):
             return monsters
 
         # 使用攻击框筛选
-        attack_range = self.cfg.get("thresholds", {}).get("attack_range", 160)
+        attack_range = float(self._thresholds().get("attack_range", 160))
         d = self._facing
 
         # 用攻击框过滤
@@ -559,7 +643,7 @@ class BotEngine(threading.Thread):
         return result if result else monsters  # 最终回退：返回全部
 
     def _decide(self, frame, monsters, player, player_map):
-        keys, th = self.cfg["keys"], self.cfg["thresholds"]
+        keys, th = self.cfg["keys"], self._thresholds()
         patrol = self.cfg.get("patrol", {})
         now = time.time()
         patrol_on = patrol.get("enabled") and self.route_nav.ready
@@ -609,7 +693,7 @@ class BotEngine(threading.Thread):
                 fought = True
                 if self._chase_t0 is None:
                     self._chase_t0 = now
-                if now - self._chase_t0 > patrol.get("max_chase_time", 4.0):
+                if now - self._chase_t0 > float(patrol.get("max_chase_time", 4.0)):
                     self._giveup_until = now + 5.0
                     self._chase_t0 = None
                     self.move.release_all()
@@ -633,6 +717,7 @@ class BotEngine(threading.Thread):
             if cmd.dir and cmd.dir != 0:
                 self._facing = cmd.dir
             self.move.set_climb(cmd.climb)
+            # 跳跃：grab 阶段允许跳抓绳，jump 仅在抓绳失败重试时返回
             if cmd.jump:
                 if cmd.vdir:
                     self.controller.combo(keys.get("jump"), keys.get(cmd.vdir))
@@ -679,7 +764,7 @@ class BotEngine(threading.Thread):
         keys, th = self.cfg["keys"], self.cfg["thresholds"]
         anchor = player if player is not None else \
             (frame.shape[1] // 2, frame.shape[0] // 2, 1.0, 0, 0)
-        ax, ay = anchor[0], anchor[1]
+        ax, ay = float(anchor[0]), float(anchor[1])
         attack_range = th.get("attack_range", 160)
         skill_range = th.get("skill_range", 60)  # 攻击框垂直向下范围
 
@@ -762,7 +847,7 @@ class BotEngine(threading.Thread):
         key = self.cfg["keys"].get("pickup")
         if not key:
             return
-        if now - self._loot_t < self.cfg["thresholds"].get("pickup_interval", 0.9):
+        if now - self._loot_t < self._thresholds().get("pickup_interval", 0.9):
             return
         self._loot_t = now
         self.controller.tap(key, hold=0.04)
@@ -784,38 +869,130 @@ class BotEngine(threading.Thread):
             return self._resting
         if self._sess_end is None:
             self._start_session(now)
-        elif now >= self._sess_end:  # 本轮结束 → 找安全点休息
-            if self.route_nav.has_stop:
-                if self._grace_until is None:
-                    self._grace_until = now + sch.get("safe_stop_wait", 120)
-                    self.log("本轮挂机结束，走向停止标记(安全点)…", "info")
-                if now < self._grace_until:
-                    if self._last_map_pos and \
-                            self.route_nav.near_stop(self._last_map_pos):
+        elif now >= self._sess_end:  # 本轮结束 → 找最近绳子作为安全点休息
+            if self._grace_until is None:
+                self._grace_until = now + float(sch.get("safe_stop_wait", 120))
+                self._rest_rope = None  # 重置目标绳子
+                self.log("本轮挂机结束，走向最近绳子(安全点)…", "info")
+            if now < self._grace_until and self._last_map_pos:
+                px, py = self._last_map_pos
+                # 找最近绳子（只找一次并缓存）
+                if self._rest_rope is None:
+                    self._rest_rope = self.route_nav.nearest_rope_for_rest(px, py)
+                rope = self._rest_rope
+                if rope and rope[0] is not None:
+                    top_y, bottom_y, cx = rope
+                    # y 在绳子两端之间 → 到达休息点
+                    if top_y <= py <= bottom_y:
                         self._begin_rest(now)
+                    else:
+                        # 走向绳子（x 对齐 + 上下移动）
+                        cmd = self.route_nav.move_to_rope_cmd(px, py, rope, now)
+                        self._exec_route_cmd(cmd)
+                        self._rest_status = cmd.status
                 else:
+                    # 找不到绳子，直接休息
                     self._begin_rest(now)
             else:
                 self._begin_rest(now)
         return self._resting
 
+    # ================= 定时下线 / 上线 =================
+    def _today_ts(self, hhmm):
+        """把 'HH:MM' 转成今天该时刻的时间戳；解析失败返回 None。"""
+        try:
+            h, m = hhmm.split(":")
+            h, m = int(h), int(m)
+        except Exception:
+            return None
+        t = _dt.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+        return t.timestamp()
+
+    def _logout_login_tick(self, now):
+        """定时下线/上线调度。返回 True 表示当前处于下线/上线流程中（跳过战斗）。"""
+        sch = self.cfg.get("schedule", {})
+        today = _dt.date.today().toordinal()
+
+        # ---------- 定时下线 ----------
+        if sch.get("logout_enabled") and not self._logged_out and \
+                self._logout_done_today != today:
+            if self._logout_deadline is None:
+                base = self._today_ts(sch.get("logout_time", "23:00"))
+                if base is not None:
+                    # 设置时间 + 随机 3~8 分钟
+                    self._logout_deadline = base + random.uniform(180, 480)
+                    self.log(f"⏰ 定时下线将于 {_dt.datetime.fromtimestamp(self._logout_deadline).strftime('%H:%M:%S')} 执行", "info")
+            if self._logout_deadline is not None and now >= self._logout_deadline:
+                self._do_logout()
+                self._logout_done_today = today
+                self._login_done_today = None  # 重置上线标记
+                return True
+
+        # ---------- 定时上线 ----------
+        if self._logged_out and sch.get("login_enabled") and \
+                self._login_done_today != today:
+            if self._login_deadline is None:
+                base = self._today_ts(sch.get("login_time", "08:00"))
+                if base is not None:
+                    # 如果上线时间已过（比如刚下线），用明天的时间
+                    if base < now:
+                        base += 86400
+                    self._login_deadline = base + random.uniform(180, 480)
+                    self.log(f"⏰ 定时上线将于 {_dt.datetime.fromtimestamp(self._login_deadline).strftime('%H:%M:%S')} 执行", "info")
+            if self._login_deadline is not None and now >= self._login_deadline:
+                # 按 enter 上线
+                self.log("⌨ 执行上线：按 Enter…", "info")
+                keys = self.cfg["keys"]
+                self.controller.tap(keys.get("enter"))
+                self._login_deadline = None  # 重置，等待检测玩家
+                # 玩家识别由主循环中的检测处理，_last_player 不为 None 时上线成功
+            # 已下线或上线等待中：检测到玩家则恢复
+            if self._last_player is not None:
+                self._logged_out = False
+                self._login_done_today = today
+                self.log("✅ 检测到玩家，上线成功，恢复巡逻", "ok")
+            return True  # 下线/上线等待中，跳过战斗
+
+        return False
+
+    def _do_logout(self):
+        """执行下线：esc → up → enter"""
+        self.log("⌨ 执行下线：Esc → ↑ → Enter…", "warn")
+        self.move.release_all()
+        keys = self.cfg["keys"]
+        # 依次按键，每个间隔 0.4 秒
+        self.controller.tap(keys.get("escape"))
+        time.sleep(0.4)
+        self.controller.tap(keys.get("up"))
+        time.sleep(0.4)
+        self.controller.tap(keys.get("enter"))
+        self._logged_out = True
+        self._logout_deadline = None
+        self.log("🚪 已发送下线指令", "warn")
+
     def _start_session(self, now):
         sch = self.cfg.get("schedule", {})
-        base = sch.get("duration_min", 60) * 60
+        base = float(sch.get("duration_min", 60)) * 60
         self._sess_end = now + base + random.uniform(-180, 180)  # ±3分钟
         self._grace_until = None
         self.log(f"⏱ 本轮挂机约 {int((self._sess_end - now) // 60)} 分钟（随机±3分钟）", "info")
 
     def _begin_rest(self, now):
         sch = self.cfg.get("schedule", {})
-        lo, hi = sch.get("rest_lo_min", 5), sch.get("rest_hi_min", 10)
+        lo, hi = float(sch.get("rest_lo_min", 5)), float(sch.get("rest_hi_min", 10))
         self._resting = True
         self._rest_until = now + random.uniform(lo, hi) * 60
         self._sess_end = None
         self._grace_until = None
+        self._rest_rope = None
         self.move.release_all()
         self.log(f"😴 进入休息 {int((self._rest_until - now) // 60)} 分钟"
                  f"（血蓝监控保持运行）", "warn")
+
+    def _exec_route_cmd(self, cmd):
+        """执行 RouteCmd 的方向/攀爬指令（用于走向绳子等非战斗移动）。"""
+        self.move.set_dir(cmd.dir)
+        self.move.set_climb(cmd.climb)
 
     def _attack(self):
         keys = self.cfg["keys"]
@@ -850,8 +1027,8 @@ class BotEngine(threading.Thread):
             # 玩家位置必须基本在画面内才画攻击框，否则是识别错误导致的废位置
             if 0 <= ax < fw and 0 <= ay < fh:
                 d = self._facing if self._facing else 1
-                attack_range = self.cfg.get("thresholds", {}).get("attack_range", 160)
-                skill_range = self.cfg.get("thresholds", {}).get("skill_range", 60)
+                attack_range = float(self._thresholds().get("attack_range", 160))
+                skill_range = float(self._thresholds().get("skill_range", 60))
                 box = self.route_nav.get_attack_range_box((ax, ay), d, attack_range, skill_range)
                 if box:
                     x0, y0, x1, y1 = box

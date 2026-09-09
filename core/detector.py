@@ -28,7 +28,11 @@ class Template:
         img = imread_u(path, cv2.IMREAD_COLOR)  # 原 cv2.imread（中文路径安全版）
         if img is None:
             raise FileNotFoundError(f"模板读取失败(文件不存在或解码异常): {path}")
-        self.gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # 灰度匹配抗光照
+        # 同时缓存彩色图与灰度图：
+        #   - self.img  (BGR彩色): 供 find_pic 做彩色模板匹配使用
+        #   - self.gray (灰度):    供 find_all 做灰度匹配使用（更快、抗光照）
+        self.img = img
+        self.gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         self.h, self.w = self.gray.shape[:2]
 
 
@@ -45,6 +49,73 @@ class TemplateDetector:
     def clear(self):
         """清空全部模板（重载配置 / 删除地图包时调用）"""
         self.templates.clear()
+
+    def replace_all(self, templates_dict):
+        """v21: 原子替换全部模板（避免 clear+逐个 load 时被遍历线程看到中间态）"""
+        self.templates = templates_dict
+
+    def find_pic(self, name, scene_bgr, similarity=0.9, offset=(0, 0)):
+        """v20: 用户提供的 find_pic 算法（彩色 TM_CCORR_NORMED + 斜边去重）
+
+        与原 find_all 区别：
+          - 彩色匹配（非灰度），用 TM_CCORR_NORMED（非 TM_CCOEFF_NORMED）
+          - 去重用斜边平方（hypotenuse_sqr = h² + w²）作为距离阈值，
+            两匹配点距离平方 <= 模板对角线平方 → 视为同一目标，只留第一个
+
+        参数:
+            name: 模板名
+            scene_bgr: 游戏画面截图（BGR）
+            similarity: 相似度阈值，默认 0.9
+            offset: (x1, y1) 场景裁剪偏移，匹配坐标会加上 offset 还原到整帧坐标系
+
+        返回: [(cx, cy, conf, w, h), ...] 中心点列表（坐标已还原到整帧坐标系）
+        """
+        tpl = self.templates.get(name)
+        if tpl is None or scene_bgr is None:
+            return []
+        x1, y1 = offset
+        img_template = tpl.img
+        height, width = img_template.shape[:2]
+        sh, sw = scene_bgr.shape[:2]
+        if sh < height or sw < width:
+            return []
+
+        # 斜边平方作为去重距离阈值（模板对角线平方）
+        hypotenuse_sqr = height ** 2 + width ** 2
+
+        # 彩色模板匹配
+        template_res = cv2.matchTemplate(scene_bgr, img_template, cv2.TM_CCORR_NORMED)
+        res = np.where(template_res >= similarity)
+        res_zip = zip(res[0], res[1])  # (y, x) 对
+
+        center_point_list = []
+        for a in res_zip:
+            b = a[::-1]  # 转成 (x, y)
+            # 中心点 = (x1 + b[0] + width//2, y1 + b[1] + height//2)
+            center_point = (int(x1 + b[0] + width // 2),
+                            int(y1 + b[1] + height // 2))
+            if len(center_point_list) == 0:
+                center_point_list.append(center_point)
+            else:
+                not_append = False
+                for i in center_point_list:
+                    hypotenuse_sqr_point = (center_point[0] - i[0]) ** 2 + \
+                                           (center_point[1] - i[1]) ** 2
+                    if hypotenuse_sqr_point <= hypotenuse_sqr:
+                        not_append = True
+                if not not_append:
+                    center_point_list.append(center_point)
+
+        # 转成 (cx, cy, conf, w, h) 格式，兼容下游 _box_of
+        result = []
+        for cx, cy in center_point_list:
+            # 反推匹配点分数
+            tx = cx - x1 - width // 2
+            ty = cy - y1 - height // 2
+            conf = float(template_res[ty, tx]) if 0 <= ty < template_res.shape[0] \
+                and 0 <= tx < template_res.shape[1] else 0.9
+            result.append((cx, cy, conf, width, height))
+        return result
 
     def find_all(self, name, threshold=0.8, scene_bgr=None, scene_gray=None,
                  offset=(0, 0), max_results=30):

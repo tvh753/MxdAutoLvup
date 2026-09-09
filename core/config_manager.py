@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
         "up": "up", "down": "down",          # ← 新增：抓绳/爬绳
         "teleport": "shift",              # ← 新增：法师瞬移
         "pickup": "z",  # ← 新增：拾取
+        "escape": "escape", "enter": "enter",  # ← 定时下线/上线
     },
     # ============ 识别与策略阈值 ============
     "thresholds": {
@@ -114,6 +115,8 @@ DEFAULT_CONFIG = {
         "dot_tolerance": 80,                # 玩家点颜色容差
         "search_range": 10,  # 玩家周围搜索半径（小地图px）
         "grab_tol": 4,  # 抓绳水平容差
+        "climb_grace": 3.0,  # 爬绳停稳后容错缓冲（秒）：小地图检测到玩家停止移动后，再等此时长才脱离
+        "detach_time": 2.0,  # 脱离绳子时按↑的持续时间（秒）：到达绳子顶端后按↑此时长确保脱离
         "route_path": "",  # 颜色路线图路径（地图包内）
         "current_map": "",  # 当前激活地图包名
         "dot_max_area": 40,         # 玩家点面积上限（点检测过滤）
@@ -131,6 +134,17 @@ DEFAULT_CONFIG = {
         "enabled": False, "duration_min": 60,          # 挂机时长（分钟，±3分钟随机）
         "rest_lo_min": 5, "rest_hi_min": 10,           # 休息时长范围（分钟）
         "safe_stop_wait": 120,                          # 走到安全点超时（秒）
+        # ===== 定时下线/上线 =====
+        "logout_enabled": False,       # 是否启用定时下线
+        "logout_time": "23:00",        # 下线时间（HH:MM，到点后随机+3~8分钟）
+        "login_enabled": False,        # 是否启用定时上线
+        "login_time": "08:00",         # 上线时间（HH:MM，到点后随机+3~8分钟）
+    },
+    #============ 启动/停止挂机 ============
+    "hotkeys": {
+    "start_stop": "F8",        # 启动/停止挂机
+    "pause_resume": "F9",      # 暂停/继续
+    "global_enabled": False,   # 是否启用系统全局热键（需 keyboard 库）
     },
 }
 

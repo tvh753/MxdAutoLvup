@@ -116,13 +116,28 @@ class ColorRouteNavigator:
         self._t0 = 0.0
         self._y0 = None
         self._retries = 0
-        self._grab_jumped = False
-        self._backoff_dir = 1
-        self._grab_jumped = False
-        self._backoff_dir = 1
         self._jump_at = 0.0  # 起跳时刻（空中保护窗口）
         self._phase_t = 0.0  # grab/climb 最近活跃时刻（定位丢失保护）
         self._phase_way = None  # 当前爬绳方向
+        self._search_dir = 0  # 抓绳搜索方向：0=未搜索, -1=左, 1=右
+        self._detach_sub = 0  # 脱离子阶段：0=按up, 1=按跳, 2=检查
+        self._detach_pos = None  # 脱离阶段起始位置
+        self._detach_retries = 0  # 脱离重试计数
+        # 当前绳子段的顶端/底端 y 坐标、中心 x 坐标（进入 climb 阶段时计算并缓存）
+        self._rope_top = None
+        self._rope_bottom = None
+        self._rope_cx = None  # 绳子中心 x，用于攀爬时 x 对齐
+        self._climb_start_t = 0.0  # 进入攀爬阶段的时刻，用于超时保护
+        self._climb_last_y = None  # 上一帧玩家 y，用于停滞/掉绳检测
+        self._climb_stuck_t = 0.0  # y 停止变化的起始时刻，超过阈值视为掉绳
+        self._detach_release = False  # detach 阶段先松开爬绳键的标志
+        self._detach_t0 = 0.0  # detach 阶段按↑计时起点
+        self._detach_retrigger = False  # detach 重新触发按↑的标志
+        self._detach_time = 2.0  # 脱离绳子时按↑的持续时间（秒）
+        # 爬绳停稳后的容错缓冲时间（秒）：
+        # 仅作为绳子边界无法获取时的兜底逻辑——检测到玩家停止移动后，
+        # 再等待此时长确保角色完全停稳，然后脱离绳子。
+        self._climb_grace = 3.0
         # ---- 动作冷却 ----
         self._jump_t = 0.0
         self._tp_t = 0.0
@@ -157,7 +172,8 @@ class ColorRouteNavigator:
     def configure(self, minimap=None, dot_color=None, tolerance=None,
                   search_range=None, grab_tol=None, dot_max_area=None,
                   dot_s_min=None, dot_v_min=None, dot_tpl_path=None,
-                  dot_match_sim=None, dot_match_method=None):
+                  dot_match_sim=None, dot_match_method=None,
+                  climb_grace=None, detach_time=None):
         if minimap and minimap[2] > 4 and minimap[3] > 4:
             nm = tuple(int(v) for v in minimap)
             if nm != self.minimap:
@@ -197,6 +213,12 @@ class ColorRouteNavigator:
             self.dot_match_sim = max(0.1, min(1.0, float(dot_match_sim)))
         if dot_match_method is not None:
             self.dot_match_method = max(0, min(2, int(dot_match_method)))
+        # 爬绳停稳后的容错缓冲时间（秒）：可配置，范围 0.5~10.0，默认 3.0
+        # 玩家在小地图上停止移动后，再等此时长才脱离绳子
+        if climb_grace is not None:
+            self._climb_grace = max(0.5, min(10.0, float(climb_grace)))
+        if detach_time is not None:
+            self._detach_time = max(0.5, min(10.0, float(detach_time)))
 
     def _update_hue(self):
         """根据玩家点BGR颜色计算HSV色相范围。
@@ -264,18 +286,48 @@ class ColorRouteNavigator:
         self._reset_climb()
 
     def _reset_climb(self):
+        # 如果之前处于爬绳状态（phase != "none"），重置移动计时，
+        # 防止爬绳期间位置不变导致脱困误触发跳跃；
+        # 非爬绳状态调用时不重置，保持正常脱困逻辑有效。
+        was_climbing = self._phase != "none"
         self._phase, self._t0, self._y0, self._retries = "none", 0.0, None, 0
         self._grab_jumped = False
         self._jump_at = 0.0
         self._phase_t = 0.0
         self._phase_way = None
+        self._search_dir = 0    # 抓绳搜索方向：0=未搜索, -1=左, 1=右
+        self._detach_sub = 0  # 脱离子阶段：0=按up, 1=按跳, 2=检查
+        self._detach_pos = None  # 脱离阶段起始位置
+        self._detach_retries = 0  # 脱离重试计数
+        # 当前绳子段的顶端/底端 y 坐标、中心 x 坐标（进入 climb 阶段时计算并缓存）
+        self._rope_top = None
+        self._rope_bottom = None
+        self._rope_cx = None  # 绳子中心 x，用于攀爬时 x 对齐
+        # 攀爬计时重置
+        self._climb_start_t = 0.0
+        self._climb_last_y = None
+        self._climb_stuck_t = 0.0
+        self._top_reached = False
+        self._top_reach_t = 0.0
+        # 脱离阶段状态重置
+        self._detach_release = False
+        self._detach_t0 = 0.0
+        self._detach_retrigger = False
+        if was_climbing:
+            self._move_t = time.time()
 
     def back_to_align(self):
         # 空中上升期禁止打断：外部误判会导致↑被松开、跳空
         if self._phase == "grab" and self._grab_jumped \
                 and time.time() - self._jump_at < 0.6:
             return
-        if self._phase in ("grab", "climb"):
+        # detach 阶段不打断：正在脱离绳子，打断会导致挂在绳上下不来
+        if self._phase == "detach":
+            return
+        # detach 阶段不打断：正在脱离绳子，打断会导致挂在绳上下不来
+        if self._phase == "detach":
+            return
+        if self._phase in ("grab", "climb", "search"):
             self._phase = "align"
             self._retries += 1
 
@@ -454,7 +506,7 @@ class ColorRouteNavigator:
                       or now - self._last_lock_log[2] > 30.0)
         if should_log:
             self._last_lock_log = (float(cx), float(cy), now)
-            self._log(f"🎯 模板匹配锁定小地图黄点: ({cx},{cy}) 分数={score:.3f}", "info")
+            # self._log(f"🎯 模板匹配锁定小地图黄点: ({cx},{cy}) 分数={score:.3f}", "info")
 
         # debug_cands 用于 NAV 面板上画候选小圈（这里只有一个，画玩家点本身）
         self.debug_cands = [(float(cx), float(cy))]
@@ -828,21 +880,18 @@ class ColorRouteNavigator:
 
     # ================= 主逻辑 =================
     def step(self, pos, now=None):
-        now = now if now is not None else time.time()
+        now = float(now if now is not None else time.time())
         if not self.ready:
             return RouteCmd(status="未加载颜色路线")
         if pos is None:
-            # 抓绳/攀爬中定位短暂丢失：保持↑按住别松（松开=掉绳）
+            # 抓绳/攀爬中定位短暂丢失：保持按↑别松（松开=掉绳）
             if self._phase in ("grab", "climb") and now - self._phase_t < 2.5:
-                return RouteCmd(climb=self._phase_way,
+                return RouteCmd(climb="up",
                                 status="🪢 攀爬中(定位暂失)…")
+            if self._phase == "search" and now - self._phase_t < 2.5:
+                return RouteCmd(dir=self._search_dir,
+                                status="🪢 搜索绳子(定位暂失)…")
             self._reset_climb()
-            if self._probe is not None:
-                cmd = RouteCmd(dir=self._probe_dir(), status="🔍 试探移动定位…")
-                if self._probe.get("jump"):  # 试探失败时请求的脱困跳
-                    self._probe["jump"] = False
-                    cmd.jump = True
-                return cmd
             return RouteCmd(status="🧭 定位玩家点中…")
         if (self._step_pos is None or
                 abs(pos[0] - self._step_pos[0]) >= MOVE_EPS or
@@ -899,8 +948,11 @@ class ColorRouteNavigator:
         for c in cands:
             d, idx, mx, my = c
             act = self._codes[idx][2]
-            if act in CONSUMABLE and \
-                    self._consumed.get((idx, mx // 5, my // 5), 0) > now:
+            ct = self._consumed.get((idx, mx // 5, my // 5), 0)
+            if act in CONSUMABLE and ct > now:
+                # 长冷却标记（>CONSUME_T*2）不参与回退，防止绳子重复抓取
+                if ct - now > CONSUME_T * 2:
+                    continue
                 consumed.append(c)
             else:
                 active.append(c)
@@ -965,8 +1017,9 @@ class ColorRouteNavigator:
         return None
 
     def _dispatch(self, idx, mx, my, hh, v, act, nm, x, y, now):
+        now = float(now)
         if act in CONSUMABLE:
-            self._consumed[(idx, mx // 5, my // 5)] = now + CONSUME_T
+            self._consumed[(idx, mx // 5, my // 5)] = now + 30.0
         if act == "goal":
             if now - self._goal_t > 8:
                 self.laps += 1
@@ -983,7 +1036,7 @@ class ColorRouteNavigator:
                                 status=f"✨ {nm}")
             return RouteCmd(status=f"✨ {nm}(冷却)")
         if act is None and v in ("up", "down"):
-            return self._climb(v, x, y, mx, now, nm, idx)
+            return self._climb(v, x, y, mx, my, now, nm, idx)
         self._reset_climb()
         cmd = RouteCmd(dir={"left": -1, "right": 1}.get(hh), label=nm)
         if act == "jump":
@@ -995,63 +1048,303 @@ class ColorRouteNavigator:
                      (f" · 第{self.laps}圈" if self.laps else "")
         return cmd
 
-    def _climb(self, way, x, y, mx, now, nm, idx=None):
-        # —— 攀爬中：y 持续变化则按住，停滞超时交给下一标记 ——
-        if self._phase == "climb":
-            self._phase_t, self._phase_way = now, way
-            if now - self._move_t < 0.6:
-                self._t0 = now
-                return RouteCmd(climb=way, status=f"🪢 攀爬中[{nm}]")
-            if now - self._t0 > 1.2:
+    def _rope_extent(self, idx, mx, my):
+        """获取当前绳子标记段的顶端 y、底端 y 和中心 x 坐标（小地图/路线图坐标系）。
+
+        原理：路线图 label map 中，同一根绳子的所有像素共享同一个标记索引 idx。
+        通过连通域分析找到包含标记点 (mx, my) 的那根绳子段，返回其上下边界和中心 x。
+
+        参数:
+            idx: 绳子在 label map 中的标记索引（RAW_CODES 下标）
+            mx, my: 当前绳子标记点的坐标（用于定位是哪根绳子）
+
+        返回:
+            (top_y, bottom_y, center_x) 或 (None, None, None)（找不到时）
+        """
+        lab = self._label
+        if lab is None or idx is None:
+            return None, None, None
+        h, w = lab.shape
+        if not (0 <= mx < w and 0 <= my < h):
+            return None, None, None
+        # 该绳子标记的二值图
+        mask = (lab == idx).astype(np.uint8)
+        if not mask.any():
+            return None, None, None
+        # 连通域分析（8 连通），分离多根同色绳子
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num <= 1:  # 只有背景，无连通域
+            return None, None, None
+        comp_id = int(labels[my, mx])
+        if comp_id == 0:  # 标记点落在背景上（异常）
+            return None, None, None
+        # stats[comp_id] = (x, y, w, h, area)
+        # y 即顶端，y+h-1 即底端，x + w//2 即中心 x
+        x0, y0, rw, rh, _ = stats[comp_id]
+        return int(y0), int(y0 + rh - 1), int(x0 + rw // 2)
+
+    def _nearest_rope_x(self, idx, player_x):
+        """找到离玩家 x 最近的同色绳子中心 x（处理多根绳子场景）。
+
+        参数:
+            idx: 绳子标记索引
+            player_x: 玩家当前 x 坐标
+
+        返回:
+            最近绳子的中心 x，找不到时返回 None
+        """
+        lab = self._label
+        if lab is None or idx is None:
+            return None
+        mask = (lab == idx).astype(np.uint8)
+        if not mask.any():
+            return None
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num <= 1:
+            return None
+        best_x, best_dist = None, float("inf")
+        for i in range(1, num):
+            x0, _, rw, _, _ = stats[i]
+            cx = int(x0 + rw // 2)
+            d = abs(cx - player_x)
+            if d < best_dist:
+                best_dist, best_x = d, cx
+        return best_x
+
+    # 绳子标记 idx（RAW_CODES 下标）
+    _ROPE_IDXS = (13, 14)  # 13=上爬绳, 14=下爬绳
+
+    def nearest_rope_for_rest(self, player_x, player_y):
+        """找到离玩家最近的绳子，返回 (top_y, bottom_y, center_x)。
+
+        用于本轮挂机结束后，寻路到最近绳子作为安全休息点。
+        遍历所有绳子标记（上爬绳/下爬绳），计算每个连通域到玩家的距离。
+
+        参数:
+            player_x, player_y: 玩家当前坐标（小地图坐标系）
+
+        返回:
+            (top_y, bottom_y, center_x) 或 (None, None, None)
+        """
+        lab = self._label
+        if lab is None:
+            return None, None, None
+        h, w = lab.shape
+        best = None
+        best_dist = float("inf")
+        for idx in self._ROPE_IDXS:
+            mask = (lab == idx).astype(np.uint8)
+            if not mask.any():
+                continue
+            num, labels, stats, _ = cv2.connectedComponentsWithStats(
+                mask, connectivity=8)
+            if num <= 1:
+                continue
+            for i in range(1, num):
+                x0, y0, rw, rh, _ = stats[i]
+                cx = int(x0 + rw // 2)
+                top_y = int(y0)
+                bottom_y = int(y0 + rh - 1)
+                # 用绳子中心点到玩家的距离作为判断依据
+                cy = (top_y + bottom_y) // 2
+                d = ((cx - player_x) ** 2 + (cy - player_y) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best = (top_y, bottom_y, cx)
+        return best
+
+    def move_to_rope_cmd(self, player_x, player_y, rope, now):
+        """生成走向绳子的控制指令。
+
+        参数:
+            player_x, player_y: 玩家坐标
+            rope: (top_y, bottom_y, center_x)
+            now: 当前时间
+
+        返回:
+            RouteCmd（对齐 x + 上下移动到绳子 y 区间）
+            到达绳子 y 区间时返回 status="arrived"
+        """
+        if rope is None or rope[0] is None:
+            return RouteCmd(status="no_rope")
+        top_y, bottom_y, cx = rope
+        # x 对齐
+        dx = player_x - cx
+        if abs(dx) > self.grab_tol:
+            move_dir = 1 if dx < 0 else -1
+            return RouteCmd(dir=move_dir,
+                            status=f"走向绳子x…(x={player_x:.0f}→{cx})")
+        # x 已对齐，检查 y 是否在绳子两端之间
+        if top_y <= player_y <= bottom_y:
+            return RouteCmd(status="arrived")
+        # y 不在区间，上下移动
+        if player_y < top_y:
+            return RouteCmd(climb="up",
+                            status=f"上移到绳子…(y={player_y:.0f}→{top_y}-{bottom_y})")
+        else:
+            return RouteCmd(climb="down",
+                            status=f"下移到绳子…(y={player_y:.0f}→{top_y}-{bottom_y})")
+
+    def _climb_down(self, x, y, mx, my, now, nm, idx=None):
+        """下爬：先对齐绳子 x，然后直接往下走，到达绳子底端即结束。
+
+        核心逻辑（基于坐标）：
+          1. 获取绳子底端 y 和中心 x
+          2. 若玩家 x 未对齐绳子 x（差距 > grab_tol），先横向移动对齐
+             —— 确保人物在绳子正上方，才能准确下滑
+          3. 对齐后按住↓往下爬
+          4. 玩家 y >= 绳子底端 y - 容差(2px) → 下爬结束，继续寻路
+
+        容差小（2px）：地图本身小，容差过大会导致判断不准。
+        掉绳不用管：下爬时即使掉了也无所谓，直接继续寻路即可。
+        """
+        now = float(now)
+
+        # 获取绳子边界和中心 x（只算一次并缓存）
+        if self._rope_bottom is None or self._rope_cx is None:
+            self._rope_top, self._rope_bottom, self._rope_cx = \
+                self._rope_extent(idx, mx, my)
+
+        target_y = self._rope_bottom
+        rope_x = self._rope_cx if self._rope_cx is not None else mx
+
+        # —— 步骤1: x 对齐 —— 玩家 x 与绳子中心 x 差距超过 grab_tol 时先横向移动
+        if rope_x is not None and abs(x - rope_x) > self.grab_tol:
+            move_dir = 1 if rope_x > x else -1
+            return RouteCmd(
+                dir=move_dir, climb="down",
+                status=f"🪢 对齐绳子x…(x={x}, 绳x={rope_x})")
+
+        # —— 步骤2 & 3: 到达底端则结束，否则继续往下爬 ——
+        if target_y is not None:
+            # 方向感知脱离：下爬 y 增大，y >= 底端y - 2 即到达
+            if y >= target_y - 2:
                 self._reset_climb()
-                # v20: 爬绳结束后消费该绳子标记一段时间，
-                # 避免下一帧 _choose 又选到同一个绳子标记导致反复爬绳、无法进入下一个动作
                 if idx is not None:
-                    self._consumed[(idx, mx // 5, my // 5)] = now + CONSUME_T
-                return RouteCmd(status="🪢 攀爬结束")
-            return RouteCmd(climb=way, status=f"🪢 攀爬中[{nm}]")
-        # —— 退避重试：反向走开 0.3s 再回来重新对位 ——
-        if self._phase == "backoff":
-            if now - self._t0 >= 0.3:
-                self._phase = "align"
-                return RouteCmd(dir=0, status="🪢 重新对位")
-            return RouteCmd(dir=self._backoff_dir, status="🪢 退开重试")
-        # —— 抓绳确认 ——
-        if self._phase == "grab":
+                    self._consumed[(idx, mx // 5, my // 5)] = now + 30.0
+                return RouteCmd(status="🪢 下爬结束，继续寻路")
+            return RouteCmd(
+                climb="down",
+                status=f"🪢 下滑中[{nm}](y={y:.0f}, 底端y={target_y})")
+
+        # 兜底：绳子边界无法获取时，直接往下走，超时后结束
+        self._t0 = float(self._t0)
+        if self._t0 <= 0:
+            self._t0 = now
+        if now - self._t0 > 8.0:
+            self._reset_climb()
+            if idx is not None:
+                self._consumed[(idx, mx // 5, my // 5)] = now + 30.0
+            return RouteCmd(status="🪢 下滑超时，继续寻路")
+        return RouteCmd(climb="down", status=f"🪢 下滑中[{nm}]")
+
+    def _climb(self, way, x, y, mx, my, now, nm, idx=None):
+        # 下爬与上爬是两套不同逻辑：
+        #   - down → _climb_down：直接往下走，无需抓绳/脱离
+        #   - up  → 对准x → 抓绳+攀爬(持续按↑) → 顶端后继续按↑爬出
+        if way == "down":
+            return self._climb_down(x, y, mx, my, now, nm, idx)
+
+        now = float(now)
+        self._t0 = float(self._t0)
+        self._move_t = float(self._move_t)
+        self._jump_at = float(self._jump_at)
+
+        # ===================== grab_climb 抓绳+攀爬阶段 =====================
+        # 核心思路（参考 MapleStoryAutoLevelUp）：
+        #   在绳子区域内持续按↑，不需要复杂的抓绳/脱离状态切换。
+        #   - 持续按↑爬绳
+        #   - y 2秒未变化 → 没抓到绳子 → 跳+↑重试
+        #   - x 偏离 → 横向修正
+        #   - y <= 顶端y → 到达顶端，继续按↑ 1.5秒爬出绳子 → 结束
+        if self._phase in ("grab", "climb"):
             self._phase_t, self._phase_way = now, way
-            # 已上绳：y 高于起点≥2px 且排除起跳弧线（没抓住会落回 y≈y0）
-            if self._y0 is not None and y < self._y0 - 2 and \
-                    (not self._grab_jumped or now - self._jump_at > 0.5):
-                self._phase, self._t0 = "climb", now
-                return RouteCmd(climb=way, status="🪢 已上绳")
-            if now - self._t0 > 1.6:
-                self._retries += 1
-                if self._retries >= 6:
+
+            # 1. 获取绳子边界（只算一次并缓存）
+            if self._rope_top is None or self._rope_cx is None:
+                self._rope_top, self._rope_bottom, self._rope_cx = \
+                    self._rope_extent(idx, mx, my)
+            target_y = self._rope_top  # 绳子顶端 y
+            rope_x = self._rope_cx if self._rope_cx is not None else mx
+
+            # 2. x 对齐修正（攀爬中持续保持与绳子 x 对齐）
+            climb_dir = None
+            if rope_x is not None:
+                dx = x - rope_x
+                if abs(dx) > self.grab_tol:
+                    climb_dir = 1 if dx < 0 else -1
+
+            # 3. 顶端检测：到达顶端后继续按↑ 1.5秒爬出绳子
+            top_tol = 3
+            if target_y is not None and y <= target_y + top_tol:
+                if not getattr(self, "_top_reached", False):
+                    self._top_reached = True
+                    self._top_reach_t = now
+                elif now - self._top_reach_t >= 1.5:
+                    # 已按↑ 1.5秒，角色应该已经爬出绳子
                     self._reset_climb()
-                    return RouteCmd(status="⚠ 抓绳多次失败，暂停该动作")
-                self._backoff_dir = 1 if self._retries % 2 else -1
-                self._phase, self._t0 = "backoff", now
-                return RouteCmd(dir=0, status="🪢 抓绳未果，退开重试")
-            if way == "up":
-                if not self._grab_jumped:
-                    # 先按住↑ 0.5s：站在绳底直接吸附，多数情况无需跳
-                    if now - self._t0 < 0.5:
-                        return RouteCmd(dir=0, climb="up",
-                                        status="🪢 按住↑探测绳底…")
-                    self._grab_jumped = True
+                    if idx is not None:
+                        self._consumed[(idx, mx // 5, my // 5)] = now + 30.0
+                    return RouteCmd(
+                        status=f"🪢 爬绳结束(y={y:.0f}≤顶端{target_y:.0f})，继续寻路")
+                # 顶端阶段：持续按↑爬出绳子
+                top_flag = f"顶端✓({now - self._top_reach_t:.1f}/1.5s)"
+                return RouteCmd(climb="up", dir=climb_dir,
+                                status=f"🪢 爬出绳子中[{nm}]({top_flag})")
+
+            # 4. 抓绳失败检测：y 2秒未变化 → 跳+↑重试
+            if self._y0 is not None and abs(y - self._y0) < 1:
+                if now - self._t0 > 2.0:
+                    # 找离玩家最近的绳子中心 x，校准人物位置
+                    near_x = self._nearest_rope_x(idx, x)
+                    if near_x is not None and abs(x - near_x) > self.grab_tol:
+                        move_dir = 1 if near_x > x else -1
+                        self._t0 = now
+                        self._y0 = y
+                        self._jump_at = now
+                        return RouteCmd(dir=move_dir, climb="up", jump=True,
+                                        status=f"⚠ 抓绳未果(y2s未变)，校准x→{near_x}跳抓…")
+                    # x 已对齐但仍抓不到：跳+↑重试
+                    self._t0 = now
+                    self._y0 = y
                     self._jump_at = now
                     return RouteCmd(dir=0, climb="up", jump=True,
-                                    status="🦘+🪢 原地跳抓绳")
-                return RouteCmd(dir=0, climb="up", status="🪢 抓绳中…")
-            return RouteCmd(dir=0, climb="down", status="🪢 挂绳下滑")
-        # —— 对准绳子 x ——
+                                    status="⚠ 抓绳未果(y2s未变)，跳抓重试…")
+            else:
+                # y 有变化（在爬），更新计时
+                self._y0 = y
+                self._t0 = now
+
+            # 5. 超时保护：攀爬超过 15 秒强制结束
+            climb_elapsed = now - self._climb_start_t if self._climb_start_t > 0 else 0.0
+            if climb_elapsed > 15.0:
+                self._reset_climb()
+                if idx is not None:
+                    self._consumed[(idx, mx // 5, my // 5)] = now + 30.0
+                return RouteCmd(status="🪢 攀爬超时，强制结束…")
+
+            # 6. 正常攀爬：持续按↑
+            status = f"🪢 攀爬中[{nm}](y={y:.0f}, 顶端y={target_y})"
+            if climb_dir is not None:
+                status += f" x修正→{rope_x}"
+            return RouteCmd(climb="up", dir=climb_dir, status=status)
+
+        # ===================== align 对准绳子 x =====================
         if abs(x - mx) > self.grab_tol:
             self._phase = "align"
             return RouteCmd(dir=1 if mx > x else -1,
                             status=f"🪢 对准绳子…[{nm}]")
-        # —— 到位：先停步再抓 ——
-        self._phase, self._t0, self._y0, self._grab_jumped = "grab", now, y, False
-        return RouteCmd(dir=0, status="🪢 停步准备抓绳")
+
+        # —— 到位：进入抓绳+攀爬阶段 ——
+        self._phase = "grab"
+        self._t0, self._y0 = now, y
+        self._climb_start_t = now
+        self._search_dir = 0
+        # 重置绳子边界缓存
+        self._rope_top = None
+        self._rope_bottom = None
+        self._rope_cx = None
+        return RouteCmd(dir=0, climb="up", status="🪢 开始抓绳+攀爬")
 
     def set_base(self, base_bgr):
         """注入录制时的小地图底图（滚动补偿基准）"""
@@ -1142,11 +1435,14 @@ class ColorRouteNavigator:
         返回:
             (x0, y0, x1, y1) 攻击矩形框的左上角和右下角（y0 < y1 保证合法）
         """
-        cx, cy = player_pos
-        x0 = cx - attack_range
-        x1 = cx + attack_range
-        y_top = cy
-        y_bot = cy - skill_range
+        cx, cy = float(player_pos[0]), float(player_pos[1])
+        ar = float(attack_range)
+        sr = float(skill_range)
+        x0 = cx - ar
+        x1 = cx + ar
+        # v20.1: 垂直方向向上延伸（玩家头顶区域，符合冒险岛怪物多在上方平台）
+        y_top = cy - sr
+        y_bot = cy
         # 确保 y0 < y1，矩形合法
         y0, y1 = (y_top, y_bot) if y_top < y_bot else (y_bot, y_top)
         return (x0, y0, x1, y1)

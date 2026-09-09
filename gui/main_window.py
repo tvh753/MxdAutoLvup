@@ -32,6 +32,7 @@ from tkinter import ttk, simpledialog, messagebox
 import cv2
 from PIL import Image, ImageTk
 
+from core.hotkey_manager import HotkeyManager
 from gui.theme import *
 from gui.widgets import NeoButton, Bar, KeyEntry, ScrollFrame
 from gui.region_selector import RegionSelector
@@ -81,13 +82,18 @@ class App(tk.Tk):
         self._route_img = None  # 当前颜色路线层
         self.engine.start()  # 后台线程立刻启动（IDLE 模式空转等待）
 
+        # 热键管理器需在 _build_layout 之前初始化（UI 会引用）
+        self.hotkey_mgr = HotkeyManager(self)
+
         self._build_style()
         self._build_layout()
         self._poll_status()   # 启动状态轮询
         self._poll_log()      # 启动日志轮询
-        self.bind("<F8>", self.toggle_run)
-        self.bind("<F9>", self.toggle_pause)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # self.bind("<F8>", self.toggle_run)
+        # self.bind("<F9>", self.toggle_pause)
+        # self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._apply_hotkeys()
+        self.protocol("WM_CLOSE_WINDOW", self._on_close)
         self.log("控制台就绪：① 绑定窗口 → ② 校准血蓝条/框选模板 → ③ 检查按键 → ④ ▶ 启动", "ok")
 
     # ================= 样式 =================
@@ -177,8 +183,11 @@ class App(tk.Tk):
                   padx=18).pack(side="left", padx=(0, 6))
         NeoButton(ctrl, "⏸", command=self.toggle_pause, bg="#3a3f55", fg=TEXT,
                   padx=12).pack(side="left")
-        tk.Label(left, text="F8 启动/停止 · F9 暂停/恢复（控制台聚焦时生效）",
-                 bg=PANEL, fg=TEXT_DIM, font=(FONT, 8)).pack(pady=(0, 8))
+        # tk.Label(left, text="F8 启动/停止 · F9 暂停/恢复（控制台聚焦时生效）",
+        #          bg=PANEL, fg=TEXT_DIM, font=(FONT, 8)).pack(pady=(0, 8))
+        self._hotkey_label = tk.Label(left, text="", bg=PANEL, fg=TEXT_DIM, font=(FONT, 8))
+        self._hotkey_label.pack(pady=(0, 8))
+        self._update_hotkey_label()
 
     def _build_target_tab(self, tab):
         # 窗口绑定
@@ -327,6 +336,36 @@ class App(tk.Tk):
         tk.Label(body2, text="选「普通攻击」使用攻击键；选「技能1-3随机」从已配置的技能键中随机选用",
                  fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(4, 0))
 
+        box3, body3 = self._section(tab, "⌨ 控制台热键")
+        box3.pack(fill="x", padx=8, pady=(0, 8))
+        hk_cfg = self.cfg.setdefault("hotkeys", {})
+        r1 = tk.Frame(body3, bg=PANEL_2);
+        r1.pack(fill="x", pady=2)
+        tk.Label(r1, text="启动/停止", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=10, anchor="w").pack(side="left")
+        self._hk_start_entry = KeyEntry(r1, value=hk_cfg.get("start_stop", "F8"),
+                                        on_change=lambda v: self._set_hotkey("start_stop", v))
+        self._hk_start_entry.pack(side="left")
+        r2 = tk.Frame(body3, bg=PANEL_2);
+        r2.pack(fill="x", pady=2)
+        tk.Label(r2, text="暂停/继续", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=10, anchor="w").pack(side="left")
+        self._hk_pause_entry = KeyEntry(r2, value=hk_cfg.get("pause_resume", "F9"),
+                                        on_change=lambda v: self._set_hotkey("pause_resume", v))
+        self._hk_pause_entry.pack(side="left")
+        r3 = tk.Frame(body3, bg=PANEL_2);
+        r3.pack(fill="x", pady=4)
+        self._hk_global_var = tk.BooleanVar(value=hk_cfg.get("global_enabled", False))
+        tk.Checkbutton(r3, text="启用全局热键（任意窗口焦点下生效，需 keyboard 库）",
+                       variable=self._hk_global_var,
+                       bg=PANEL_2, fg=TEXT, selectcolor="#141722",
+                       activebackground=PANEL_2, activeforeground=TEXT,
+                       font=(FONT, 9),
+                       command=lambda: self._set_hotkey_global()).pack(side="left")
+        tk.Label(body3, text="点击输入框→按键绑定；支持 F1-F12 或组合键如 ctrl+f8",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(4, 0))
+
+
     def _build_param_tab(self, tab):
         box, body = self._section(tab, "🎚 识别与策略参数")
         box.pack(fill="x", padx=8, pady=8)
@@ -415,6 +454,45 @@ class App(tk.Tk):
         tk.Label(body4, text="到点后走到路线上的停止标记(浅绿)休息 5-10 分钟再继续；"
                              "无停止标记则原地休息。休息期间血蓝监控照常运行",
                  fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(2, 0))
+
+        # ===== 定时下线/上线 =====
+        box5, body5 = self._section(tab, "🔔 定时下线 / 上线")
+        box5.pack(fill="x", padx=8, pady=(0, 8))
+        sch = self.cfg.setdefault("schedule", {})
+
+        # 下线设置
+        row_l = tk.Frame(body5, bg=PANEL_2); row_l.pack(fill="x", pady=2)
+        lout = tk.BooleanVar(value=sch.get("logout_enabled", False))
+        tk.Checkbutton(row_l, text="定时下线", variable=lout, bg=PANEL_2, fg=TEXT,
+                       selectcolor="#141722", activebackground=PANEL_2,
+                       activeforeground=TEXT, font=(FONT, 9), anchor="w",
+                       command=lambda: (sch.__setitem__("logout_enabled", lout.get()),
+                                        self.cfg_mgr.save())).pack(side="left")
+        tk.Label(row_l, text="时间", bg=PANEL_2, fg=TEXT, font=(FONT, 9)).pack(side="left", padx=(8, 2))
+        lout_time = tk.Entry(row_l, width=6, font=(MONO, 10))
+        lout_time.insert(0, sch.get("logout_time", "23:00"))
+        lout_time.pack(side="left")
+        lout_time.bind("<KeyRelease>", lambda e: (sch.__setitem__("logout_time", lout_time.get()),
+                                                  self.cfg_mgr.save()))
+        tk.Label(row_l, text="(到点+随机3~8分，esc→↑→enter)",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(side="left", padx=6)
+
+        # 上线设置
+        row_i = tk.Frame(body5, bg=PANEL_2); row_i.pack(fill="x", pady=2)
+        lin = tk.BooleanVar(value=sch.get("login_enabled", False))
+        tk.Checkbutton(row_i, text="定时上线", variable=lin, bg=PANEL_2, fg=TEXT,
+                       selectcolor="#141722", activebackground=PANEL_2,
+                       activeforeground=TEXT, font=(FONT, 9), anchor="w",
+                       command=lambda: (sch.__setitem__("login_enabled", lin.get()),
+                                        self.cfg_mgr.save())).pack(side="left")
+        tk.Label(row_i, text="时间", bg=PANEL_2, fg=TEXT, font=(FONT, 9)).pack(side="left", padx=(8, 2))
+        lin_time = tk.Entry(row_i, width=6, font=(MONO, 10))
+        lin_time.insert(0, sch.get("login_time", "08:00"))
+        lin_time.pack(side="left")
+        lin_time.bind("<KeyRelease>", lambda e: (sch.__setitem__("login_time", lin_time.get()),
+                                                 self.cfg_mgr.save()))
+        tk.Label(row_i, text="(到点+随机3~8分，按enter，识别到玩家后开始)",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(side="left", padx=6)
 
     # ---------- 右侧：预览 + 状态 + 日志 ----------
     def _build_right(self, right):
@@ -613,7 +691,22 @@ class App(tk.Tk):
         sel = self.tpl_listbox.curselection()
         if not sel:
             return
-        removed = self.cfg["monster_templates"].pop(sel[0])
+        removed = self.cfg["monster_templates"][sel[0]]
+        if not messagebox.askyesno(
+                "删除确认",
+                f"确定删除怪物模板「{removed['name']}」？\n"
+                f"对应的模板图片文件也将一并删除。",
+                parent=self):
+            return
+        # 删除模板图片文件
+        p = removed.get("path", "")
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+                self.log(f"模板图片已删除: {os.path.basename(p)}", "info")
+            except OSError as e:
+                self.log(f"模板图片删除失败: {e}", "warn")
+        self.cfg["monster_templates"].pop(sel[0])
         self.cfg_mgr.save();
         self.engine.reload_runtime();
         self.refresh_tpl_list()
@@ -946,11 +1039,58 @@ class App(tk.Tk):
     def toggle_pause(self, _e=None):
         """F9：运行 ⇄ 暂停（暂停只停按键，继续监控）"""
         if self.engine.mode == Mode.RUNNING:
-            self.engine.set_mode(Mode.PAUSED);
+            self.engine.set_mode(Mode.PAUSED)
             self.log("已暂停", "warn")
         elif self.engine.mode == Mode.PAUSED:
-            self.engine.set_mode(Mode.RUNNING);
+            self.engine.set_mode(Mode.RUNNING)
             self.log("恢复运行", "ok")
+
+    def _set_hotkey(self, which, value):
+        """保存热键配置并重新绑定"""
+        hk = self.cfg.setdefault("hotkeys", {})
+        hk[which] = value
+        self.cfg_mgr.save()
+        self._apply_hotkeys()
+        self._update_hotkey_label()
+
+    def _set_hotkey_global(self):
+        """切换全局热键模式"""
+        hk = self.cfg.setdefault("hotkeys", {})
+        enabled = self._hk_global_var.get()
+        # 全局热键需要 keyboard 库支持；不可用时回退局部模式并提示
+        if enabled and not self.hotkey_mgr.global_supported:
+            self.log("未安装 keyboard 库，全局热键不可用，回退为局部模式", "warn")
+            enabled = False
+            self._hk_global_var.set(False)
+        hk["global_enabled"] = enabled
+        self.cfg_mgr.save()
+        self._apply_hotkeys()
+        self._update_hotkey_label()
+
+    def _apply_hotkeys(self):
+        """从配置读取热键并绑定"""
+        hk = self.cfg.get("hotkeys", {})
+        k_start = hk.get("start_stop", "F8")
+        k_pause = hk.get("pause_resume", "F9")
+        global_en = hk.get("global_enabled", False)
+        self.hotkey_mgr.set_global(global_en)
+        self.hotkey_mgr.bind(k_start, self.toggle_run)
+        self.hotkey_mgr.bind(k_pause, self.toggle_pause)
+        label = "全局" if (global_en and self.hotkey_mgr.global_supported) else "局部(控制台聚焦时)"
+        self.log(f"热键已绑定：{k_start}=启动/停止，{k_pause}=暂停/继续 [{label}]", "info")
+
+    def _update_hotkey_label(self):
+        if not hasattr(self, "hotkey_mgr") or self.hotkey_mgr is None:
+            return
+        hk = self.cfg.get("hotkeys", {})
+        k_start = hk.get("start_stop", "F8")
+        k_pause = hk.get("pause_resume", "F9")
+        global_en = hk.get("global_enabled", False)
+        mode = "全局" if (global_en and self.hotkey_mgr.global_supported) else "控制台聚焦时"
+        if self.hotkey_mgr and not self.hotkey_mgr.global_supported and global_en:
+            mode = "控制台聚焦时(未装keyboard库)"
+        self._hotkey_label.config(
+            text=f"{k_start}=启动/停止 · {k_pause}=暂停/继续 [{mode}]")
 
     def log(self, msg, lv="info"):
         """向日志队列推一条日志（引擎线程/GUI 线程共用）"""
@@ -1021,6 +1161,7 @@ class App(tk.Tk):
 
     def _on_close(self):
         """关窗：先停引擎线程并保存配置，再销毁窗口"""
+        self.hotkey_mgr.cleanup()
         self.engine.shutdown()
         self.cfg_mgr.save()
         self.destroy()
