@@ -257,9 +257,10 @@ class BotEngine(threading.Thread):
 
     def _rope_assist(self, frame, cmd, now):
         """对准阶段：主画面绳子精调（小地图缩放误差兜底）。
-        v9 收紧：仅 align 阶段干预——grab 起跳后覆盖方向/打回对位
-        会造成空中横移、松开↑，正是“跳起来抓不到绳”的元凶；
-        玩家模板未检出时锚点=画面中心不可靠，同样不干预"""
+        v25: 加入 grab 阶段——此时还没抓住绳子，横移修正不影响抓取，
+            但绝不能覆盖 climb 阶段（已抓住绳子，干扰会导致掉绳）。"""
+        if self.route_nav.phase not in ("align", "grab"):
+            return
         if self.route_nav.phase != "align":
             return
         if now - self._rope_t < 0.25:

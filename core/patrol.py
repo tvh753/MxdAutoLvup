@@ -75,6 +75,8 @@ class PatrolNavigator:
         self._y0 = None
         self._retries = 0
         self._backoff_dir = 1
+        self.pre_grab_wait = 0.15  # 到位停步等待（秒）
+        self.dismount_jump_delay = 0.08
 
     # ================= 配置 =================
     def configure(self, minimap=None, dot_color=None, tolerance=None,
@@ -274,7 +276,7 @@ class PatrolNavigator:
         # ---------- 绳索 ----------
         grab_key = "up" if act == ROPE_UP else "down"
 
-        if self._phase == "backoff":  # 抓绳失败退开重试
+        if self._phase == "backoff":
             if now - self._t0 >= 0.35:
                 self._phase = "approach"
                 return PatrolCommand(dir=0, status="🪢 重新对位")
@@ -282,14 +284,21 @@ class PatrolNavigator:
 
         if self._phase == "approach":
             if abs(x - wx) <= self.grab_tol:
-                self._phase, self._t0, self._y0 = "grabbing", now, y
-                return PatrolCommand(dir=0, climb=grab_key, status="🪢 抓绳…")
+                self._phase, self._t0, self._y0 = "pre_grab", now, y
+                return PatrolCommand(dir=0, status="🪢 到位，停步准备抓绳")
             return PatrolCommand(dir=1 if wx > x else -1,
                                  status=f"🚶→🪢 路点 {self._idx + 1}/{n}")
 
+        if self._phase == "pre_grab":
+            if now - self._t0 < self.pre_grab_wait:
+                return PatrolCommand(dir=0, status="🪢 停步等待微调")
+            # 原地跳 + 持按抓绳（engine 可同时处理 jump + climb）
+            self._phase, self._t0 = "grabbing", now
+            return PatrolCommand(jump=True, climb=grab_key, status="🪢 原地跳+抓绳…")
+
         if self._phase == "grabbing":
             if self._y0 is not None and abs(y - self._y0) >= 2:
-                self._phase, self._t0, self._y0 = "climbing", now, y  # y 变化=已上绳
+                self._phase, self._t0, self._y0 = "climbing", now, y
                 return PatrolCommand(dir=0, climb=grab_key, status="🪢 攀爬中")
             if now - self._t0 >= self.grab_timeout:
                 self._retries += 1
@@ -306,11 +315,20 @@ class PatrolNavigator:
         reached = (y <= wy + self.arrive_tol) if act == ROPE_UP \
             else (y >= wy - self.arrive_tol)
         if reached:
+            # 进入短时脱离动作：先松手，再短跳并做微小横向偏移以确保脱绳
+            self._phase, self._t0 = "dismount", now
+            return PatrolCommand(climb=None, dir=0, status="🪢 到位，准备脱离")
+
+        if self._phase == "dismount":
+            if now - self._t0 < self.dismount_jump_delay:
+                # 这里偏移方向可调整为 -self._dir 或固定方向，尝试反向小移以脱离平台
+                return PatrolCommand(jump=True, dir=-self._dir, status="🪢 脱离跳跃+偏移")
             self.advance()
-            return PatrolCommand(climb=None, dir=0, status="🪢 到位 → 下一路点")
+            return PatrolCommand(status="✔ 脱离 → 下一路点")
+
         if self._y0 is None or abs(y - self._y0) >= 1:
-            self._y0, self._t0 = y, now  # 还在爬，刷新计时
-        elif now - self._t0 >= 1.6:  # 爬到绳端自动脱出等
+            self._y0, self._t0 = y, now
+        elif now - self._t0 >= 1.6:
             self.advance()
             return PatrolCommand(climb=None, dir=0,
                                  status="⚠ 绳索停滞，跳过该路点")
