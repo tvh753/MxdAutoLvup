@@ -1,5 +1,82 @@
-opencv-python>=4.8
-numpy>=1.24
-pywin32>=306
+# =====================================================================
+# 枫叶挂机控制台 · 依赖清单
+# =====================================================================
+# 使用方式：
+#   pip install -r requirements.txt
+#   （如果 Windows 下 pywin32 装不上，见文件末尾的说明）
+# =====================================================================
+
+# =====================================================================
+# 核心依赖（必装）
+# =====================================================================
+
+# ---- 图像处理与数值计算 ----
+# cv2：截图、模板匹配、图像缩放、绘制识别框
+# numpy：图像数组运算、坐标计算
+opencv-python>=4.5.0
+numpy>=1.19.0
+
+# ---- 键盘模拟 ----
+# pydirectinput：用 DirectInput 扫描码发送按键（普通 keybd_event 在部分游戏无效）
 pydirectinput>=1.0.4
-Pillow>=10.0
+
+# ---- Windows 窗口操作 ----
+# pywin32：提供 win32gui / win32ui / win32api / win32con
+#   用于 GetClientRect、PrintWindow、ClientToScreen 等底层窗口 API
+# 仅在 Windows 平台需要；Linux/macOS 上会跳过
+pywin32>=300 ; sys_platform == "win32"
+
+# ---- GUI 图像显示 ----
+# Pillow：把 OpenCV 的 numpy 数组转成 tkinter 能显示的 PhotoImage
+Pillow>=9.0.0
+
+
+# =====================================================================
+# 可选依赖（按需安装）
+# =====================================================================
+
+# ---- 高速截图（推荐） ----
+# windows_capture：基于 Windows.Graphics.Capture API 的异步截图
+#   装了它 → 使用 FastWindowCapture，FPS 10~20，单帧 ~5ms
+#   不装   → 回退到 WindowCapture（PrintWindow），FPS 3~5，单帧 ~100ms
+# 仅 Windows 可用
+windows-capture>=1.4.0 ; sys_platform == "win32"
+
+# ---- VNC 虚拟机模式 ----
+# vncdotool：通过 VNC 协议连接虚拟机，抓屏 + 发送键鼠
+# 仅在 capture_mode = "vnc" 时需要
+vncdotool>=1.2.0
+
+# ---- 全局热键 ----
+# keyboard：注册系统级键盘钩子（任意窗口焦点下 F8/F9 都能生效）
+# 仅在 hotkeys.global_enabled = true 时需要
+# 若不装，热键只在控制台窗口聚焦时生效
+# 注意：Windows 下可能需要管理员权限；Linux 下需要 root
+keyboard>=0.13.5
+
+
+# =====================================================================
+# 备注
+# =====================================================================
+#
+# 1. Python 版本
+#    · 建议 Python 3.9 ~ 3.11
+#    · 3.12 部分依赖（pydirectinput、windows-capture）兼容性尚未完全验证
+#    · tkinter 是 Python 标准库，无需 pip 安装
+#      - Windows 官方 Python 安装包默认自带
+#      - Linux 需要：sudo apt install python3-tk
+#      - macOS 需要：brew install python-tk
+#
+# 2. pywin32 安装失败的处理
+#    如果 `pip install pywin32` 报错，尝试：
+#      · 用管理员权限运行 cmd / PowerShell
+#      · 或换用预编译 wheel：pip install pypiwin32
+#      · 或先升级 pip：python -m pip install --upgrade pip setuptools wheel
+#
+# 3. windows-capture 版本说明
+#    本项目使用的是"装饰器注册事件 + start_free_threaded()"的 API，
+#    需要 windows-capture >= 1.4.0。低版本 API 不兼容，会报 AttributeError。
+#
+# 4. 平台兼容性
+#    本项目主要面向 Windows（DirectInput 键鼠 + GDI 截图）。
+#    Linux/macOS 上可以运行核心识别逻辑，但键盘模拟、窗口截图需要适配。
