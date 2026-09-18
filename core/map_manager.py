@@ -113,9 +113,10 @@ class MapManager:
                 not imwrite_u(self._path(name, "minimap.png"), minimap_img):
             raise IOError(f"小地图底图写入失败: {d}")
         # ② 路线图：有新图才写；None 时保留包内旧图（重存不洗掉路线）
-        if route_img is not None and \
-                not imwrite_u(self._path(name, "route.png"), route_img):
-            raise IOError(f"路线图写入失败: {d}")
+        #    v27: route_img 可为单张或列表，交给 save_route 统一处理
+        if route_img is not None:
+            if not self.save_route(name, route_img):
+                raise IOError(f"路线图写入失败: {d}")
         # ③ 怪物绑定：当前配置模板 → 拷入包内，统一指向包内路径
         monsters = []
         for t in cfg.get("monster_templates", []):
@@ -143,13 +144,24 @@ class MapManager:
                     os.remove(fp)
                 except OSError:
                     pass
+        # 状态条：规范化结构（保证 x/y/w/h 四个键都存在），避免
+        # 因 cfg 里某 bar 是 {} 或 None 导致 profile.json 里写入不完整。
+        def _norm_bar(d):
+            if not isinstance(d, dict):
+                return {"x": 0, "y": 0, "w": 0, "h": 0}
+            return {
+                "x": int(d.get("x", 0) or 0),
+                "y": int(d.get("y", 0) or 0),
+                "w": int(d.get("w", 0) or 0),
+                "h": int(d.get("h", 0) or 0),
+            }
         profile = {
             "window_title": cfg.get("window_title", ""),
             "keys": cfg.get("keys", {}),
             "detect_region": cfg.get("detect_region"),
-            "hp_bar": cfg.get("hp_bar", {}),
-            "mp_bar": cfg.get("mp_bar", {}),
-            "exp_bar": cfg.get("exp_bar", {}),
+            "hp_bar": _norm_bar(cfg.get("hp_bar")),
+            "mp_bar": _norm_bar(cfg.get("mp_bar")),
+            "exp_bar": _norm_bar(cfg.get("exp_bar")),
             "patrol": {
                 "minimap": cfg.get("patrol", {}).get("minimap", {}),
                 "player_dot_color": cfg.get("patrol", {}).get("player_dot_color"),
@@ -157,6 +169,8 @@ class MapManager:
                 "dot_max_area": cfg.get("patrol", {}).get("dot_max_area", 40),
                 "search_range": cfg.get("patrol", {}).get("search_range", 10),
                 "grab_tol": cfg.get("patrol", {}).get("grab_tol", 4),
+                # ★ 新增：每张地图独立保存坐标偏移
+                "map_offset": cfg.get("patrol", {}).get("map_offset", [0, 0]),
                 "enabled": True,
                 "route_path": self._path(name, "route.png"),
                 "current_map": name,
@@ -189,10 +203,20 @@ class MapManager:
             return False, []
         profile.setdefault("patrol", {})["route_path"] = \
             self._path(name, "route.png")
-        for key in ("window_title", "keys", "detect_region", "hp_bar",
-                    "mp_bar", "exp_bar", "monster_templates"):
+        # 通用字段：直接覆盖
+        for key in ("window_title", "keys", "detect_region",
+                    "monster_templates"):
             if key in profile:
                 cfg[key] = profile[key]
+        # ★ 状态条字段：只在包内有效（w>4 且 h>4）时才覆盖 ——
+        #   避免"保存地图时 HP 条还没校准（w=0）"的地图包加载后，
+        #   把当前已校准的 HP 条拉回 0，导致 HP 检测失效。
+        for key in ("hp_bar", "mp_bar", "exp_bar"):
+            if key in profile:
+                p = profile[key]
+                if isinstance(p, dict) and \
+                        p.get("w", 0) > 4 and p.get("h", 0) > 4:
+                    cfg[key] = p
         cur = dict(cfg.get("patrol", {}))
         deep_merge(cur, profile.get("patrol", {}))
         cfg["patrol"] = cur
@@ -224,20 +248,213 @@ class MapManager:
         return imread_u(self._path(name, "minimap.png"))
 
     def load_route(self, name):
-        """读取地图包的颜色路线图"""
-        return imread_u(self._path(name, "route.png"))
+        """读取地图包的颜色路线图
+
+        v27 返回列表（长度 ≥1）或 None：
+          · 优先扫 route1.png / route2.png / ...（多路线）
+          · 退而求其次读 route.png（单条，兼容旧包）
+        """
+        import glob as _glob
+        d = self._path(name)
+        # 优先多路线
+        multi = _glob.glob(os.path.join(d, "route[0-9]*.png"))
+        if multi:
+            # 按数字排序（route1 < route2 < route10）
+            def _key(p):
+                base = os.path.basename(p)
+                num = base[5:-4]
+                return int(num) if num.isdigit() else 0
+            multi.sort(key=_key)
+            imgs = [imread_u(p) for p in multi]
+            imgs = [img for img in imgs if img is not None]
+            if imgs:
+                return imgs
+        # 退回单条
+        single = imread_u(os.path.join(d, "route.png"))
+        return [single] if single is not None else None
 
     def save_minimap(self, name, img):
         """写入小地图底图，成功返回 True"""
         return img is not None and imwrite_u(self._path(name, "minimap.png"), img)
 
     def save_route(self, name, route_img):
-        """写入颜色路线图，成功返回 True"""
-        return route_img is not None and \
-            imwrite_u(self._path(name, "route.png"), route_img)
+        """写入颜色路线图，成功返回 True
+
+        v27 支持多路线：
+          · route_img 是单张 numpy → 写 route.png（兼容旧格式）
+          · route_img 是列表：
+              - 长度 1 → 写 route.png
+              - 长度 ≥2 → 写 route1.png / route2.png / ...
+        无论哪种情况，都会先清掉旧的 route*.png，避免格式切换时残留。
+        """
+        import glob as _glob
+        d = self._path(name)
+        os.makedirs(d, exist_ok=True)
+
+        # 统一成列表
+        if route_img is None:
+            return False
+        if isinstance(route_img, list):
+            imgs = [r for r in route_img if r is not None]
+        else:
+            imgs = [route_img]
+        if not imgs:
+            return False
+
+        # 清理旧的 route*.png（避免与旧文件混存）
+        for old in _glob.glob(os.path.join(d, "route*.png")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+        if len(imgs) == 1:
+            return imwrite_u(self._path(name, "route.png"), imgs[0])
+
+        ok = True
+        for i, img in enumerate(imgs, start=1):
+            if not imwrite_u(self._path(name, f"route{i}.png"), img):
+                ok = False
+        return ok
+
+    def update_profile(self, name, updates):
+        """部分更新地图包 profile.json（深合并）
+
+        参数:
+            name: 地图包名
+            updates: dict，如 {"patrol": {"offset": [412, -85]}}
+        """
+        import json
+        pack_dir = os.path.join(self.maps_dir, name)
+        if not os.path.isdir(pack_dir):
+            raise IOError(f"地图包不存在: {name}")
+        profile_path = os.path.join(pack_dir, "profile.json")
+        data = {}
+        if os.path.isfile(profile_path):
+            try:
+                with open(profile_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        # 深合并
+        def _merge(base, new):
+            for k, v in new.items():
+                if isinstance(v, dict) and isinstance(base.get(k), dict):
+                    _merge(base[k], v)
+                else:
+                    base[k] = v
+
+        _merge(data, updates)
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+
+    # ---------------- config_map.yaml 集成 ----------------
+    def _yaml_path(self):
+        """config_map.yaml 的绝对路径（固定放在 <root>/config/ 下）"""
+        root = os.path.dirname(self.maps_dir)
+        return os.path.join(root, "config", "config_map.yaml")
+
+    def add_yaml_entry(self, name, package=None):
+        """向 config_map.yaml 追加/更新一条 map 条目（幂等）
+
+        参数:
+            name    —— 下拉列表显示名（配置名）
+            package —— 地图包目录名；缺省与 name 相同
+        说明:
+            · 已存在同名条目 → 只更新 package
+            · 不存在 → 追加
+            · 没有 config_map.yaml → 自动创建
+        """
+        try:
+            import yaml
+        except ImportError:
+            return False
+        path = self._yaml_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        data = {"maps": []}
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {"maps": []}
+            except Exception:
+                data = {"maps": []}
+        if not isinstance(data.get("maps"), list):
+            data["maps"] = []
+
+        pkg = package or name
+        for entry in data["maps"]:
+            if entry.get("name") == name:
+                entry["package"] = pkg
+                break
+        else:
+            data["maps"].append({"name": name, "package": pkg})
+
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        return True
+
+    def remove_yaml_entry(self, name):
+        """从 config_map.yaml 移除指定 name 的条目
+
+        返回 True 表示真删了，False 表示没找到
+        """
+        try:
+            import yaml
+        except ImportError:
+            return False
+        path = self._yaml_path()
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {"maps": []}
+        except Exception:
+            return False
+        if not isinstance(data.get("maps"), list):
+            return False
+
+        before = len(data["maps"])
+        data["maps"] = [e for e in data["maps"] if e.get("name") != name]
+        if len(data["maps"]) == before:
+            return False
+
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        return True
+
+    def read_profile(self, name):
+        """读取地图包 profile.json，返回 dict 或 None"""
+        path = self._path(name, "profile.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def create(self, name):
+        """创建空地图包目录（同时写 config_map.yaml）"""
+        pack_dir = os.path.join(self.maps_dir, name)
+        if os.path.isdir(pack_dir):
+            return False
+        os.makedirs(pack_dir, exist_ok=True)
+        os.makedirs(os.path.join(pack_dir, "monsters"), exist_ok=True)
+        profile_path = os.path.join(pack_dir, "profile.json")
+        if not os.path.isfile(profile_path):
+            with open(profile_path, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=2)
+        # ★ 同步写入 config_map.yaml
+        self.add_yaml_entry(name)
+        return True
 
     def delete(self, name):
-        """删除整个地图包目录（真删除，谨慎调用）"""
+        """删除整个地图包目录 + 从 config_map.yaml 移除"""
         d = self._path(name)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
+        # ★ 同步移除 yaml 条目
+        self.remove_yaml_entry(name)
