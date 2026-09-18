@@ -348,12 +348,6 @@ class BotEngine(threading.Thread):
                     except Exception as e:
                         self.log(f"模板加载失败 [{item['name']}]: {e}", "warn")
 
-        # ---- 日志汇总 ----
-        if loaded_names:
-            self.log(f"🎯 识别模板 ({len(loaded_names)}): {loaded_names}", "info")
-        else:
-            self.log("⚠ 未加载任何怪物模板", "warn")
-
         # ---- 玩家模板 ----
         pt = self.cfg.get("player_template")
         tpl_path = resolve_player_path(pt.get("path")) if pt else None
@@ -424,10 +418,6 @@ class BotEngine(threading.Thread):
 
 
         rp = p.get("route_path", "")
-
-        self.log(f"[reload] route_path={rp!r} loaded={self._route_path_loaded!r}",
-                 "info")
-
         if rp and rp != self._route_path_loaded:
             import glob as _glob
             route_dir = os.path.dirname(rp)
@@ -475,9 +465,6 @@ class BotEngine(threading.Thread):
                 if tpl_path and os.path.isfile(tpl_path):
                     player_tpl_np = imread_u(tpl_path, cv2.IMREAD_COLOR)
 
-                self.log(f"[reload] 即将 load: "
-                         f"map_img={'✓'+str(map_img.shape) if map_img is not None else '✗'} "
-                         f"routes={len(route_imgs)}", "info")
                 self.route_nav.load(route_imgs, map_bgr=map_img)
 
                 ui_h = p.get("ui_y_start", 640)
@@ -489,11 +476,6 @@ class BotEngine(threading.Thread):
                 )
                 self._route_path_loaded = rp
                 self._nav_base = map_img
-
-                n = len(route_imgs)
-                mode = "大map" if map_img is not None else "小地图"
-                self.log(f"颜色路线已加载（{n} 条，{mode}坐标系）："
-                         f"{os.path.basename(route_dir)}", "info")
 
         if self.move is not None:
             self.move.bind(self.cfg["keys"])
@@ -594,7 +576,6 @@ class BotEngine(threading.Thread):
           模板识别），按键下发节奏依然是 30 FPS，游戏里角色移动不会顿。
         """
         interval = 1.0 / self.KB_FPS
-        print("[kb] 键盘线程启动")
         while not self._kb_stop:
             t0 = time.time()
             try:
@@ -1286,17 +1267,6 @@ class BotEngine(threading.Thread):
                                 break
                             time.sleep(0.005)   # 5ms 轮询，避免忙等
 
-                        # ★ 调试：每次攻击前打一次（每秒最多 1 次）
-                        now2 = time.time()
-                        if now2 - getattr(self, "_turn_dbg_t", -99.0) > 1.0:
-                            self._turn_dbg_t = now2
-                            got = self.move.current_dir_key()
-                            self.log(
-                                f"[TURN] want={want_key!r} "
-                                f"got={got!r} "
-                                f"waited={0.10 - (deadline - now2):.3f}s",
-                                "info")
-
                     # ---- 方向已确认，执行攻击 ----
                     self._do_attack()
                     self.route_nav.touch()   # 打怪时刷新停滞计时
@@ -1500,25 +1470,11 @@ class BotEngine(threading.Thread):
         rng = th.get(key, [0.20, 0.25])
         cd = random.uniform(float(rng[0]), float(rng[1]))
         if not self.controller.cooldown_ok("atk", cd):
-            # ★ 调试
-            if now - getattr(self, "_atk_dbg_t", -99) > 1.0:
-                self._atk_dbg_t = now
-                self.log(f"[ATK-DBG] 冷却未到 cd={cd:.3f}", "info")
             return None, None
 
         ml = self._get_nearest_monster(monsters, player, is_left=True)
         mr = self._get_nearest_monster(monsters, player, is_left=False)
         direction = self._get_attack_direction(ml, mr, player)
-
-        # ★ 调试：每秒一次
-        if now - getattr(self, "_atk_dbg_t", -99) > 1.0:
-            self._atk_dbg_t = now
-            px, py = player[0], player[1]
-            self.log(
-                f"[ATK-DBG] mode={mode} player=({px:.0f},{py:.0f}) "
-                f"thr={th.get('attack_range')}/{th.get('skill_range')} "
-                f"mobs={len(monsters)} ml={ml and ml[0][:2]} mr={mr and mr[0][:2]} "
-                f"dir={direction}", "info")
 
         if direction is None:
             return None, None
@@ -1553,9 +1509,6 @@ class BotEngine(threading.Thread):
         now = time.time()
         if now - getattr(self, "_atk_log_t", -99.0) > 1.0:
             self._atk_log_t = now
-            self.log(
-                f"[攻击] mode={mode} key={keys.get('attack')!r} "
-                f"hold={hold * 1000:.0f}ms", "warn")
 
         if mode == "skill":
             # 技能模式：从已配置的技能键中随机挑一个

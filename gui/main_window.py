@@ -79,7 +79,7 @@ class App(tk.Tk):
 
         # 引擎：日志回调包装成 (时间戳, 消息, 级别) 入队，GUI 轮询取出
         def _log_fn(m, lv="info"):
-            print(f"[{time.strftime('%H:%M:%S')}][{lv}] {m}")
+            # print(f"[{time.strftime('%H:%M:%S')}][{lv}] {m}")
             self.log_queue.put((time.strftime("%H:%M:%S"), m, lv))
 
         self.engine = BotEngine(self.cfg, _log_fn)

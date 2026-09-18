@@ -192,7 +192,6 @@ class HotkeyManager:
         把回调调度到 tkinter 主线程。
         """
         def _dispatch():
-            print(f"[HotkeyManager] 🎯 全局热键触发: {key_str}")
             try:
                 self.app.after(0, callback)
             except Exception as e:
@@ -285,7 +284,6 @@ class HotkeyManager:
                         pass
             # 重建全局监听
             self._rebuild_global_listener()
-            print("[HotkeyManager] 热键模式: 全局（pynput）")
         else:
             # 全局 → 局部
             self._stop_global_listener()
