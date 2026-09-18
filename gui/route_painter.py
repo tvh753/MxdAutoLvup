@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image, ImageTk
 import cv2
 from gui.widgets import NeoButton
-from gui.theme import BG, BORDER, TEXT, TEXT_DIM, FONT, ACCENT, PANEL_2
+from gui.theme import BG, BORDER, TEXT, TEXT_DIM, FONT, ACCENT, PANEL_2, MONO
 from core.color_route import RAW_CODES
 
 SNAP_DEG = 12.0  # 吸附角度容差：与横/竖夹角小于此值即吸附
@@ -34,7 +34,7 @@ class RoutePainter(tk.Toplevel):
 
     def __init__(self, master, base_bgr, route_bgr=None, on_ok=None):
         super().__init__(master)
-        self.title("🎨 颜色路线绘制器 · 按住Shift画直线")
+        self.title("🎨 颜色路线绘制器 · 底图=map.png · 按住Shift画直线")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.grab_set()
@@ -48,16 +48,49 @@ class RoutePainter(tk.Toplevel):
         self._line_start = None  # 直线模式：起点
         self._line_end = None
         self._route_backup = None  # 直线模式：起笔前快照（实时预览用）
-        self._pen_w = 2
+        self._pen_w = 1
         self._color = tuple(RAW_CODES[0][0][::-1])  # 默认红色(BGR)
         self._cur_sw = None
-        self.scale = max(1.0, min(720 / w, 520 / h, 4.0))
-        self.cw, self.ch = int(w * self.scale), int(h * self.scale)
+        # ★ v3：底图现在是 map.png（大图），自适应缩放到屏幕
+        #   · 不放大超过 1.0（超过原尺寸没意义，还看不清）
+        #   · 缩到屏幕 85% 宽 / 80% 高以内
+        #   · 下限 0.3（防止小屏幕下画布太挤）
+        try:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        # 基础缩放：自动适配屏幕 85% 宽 / 80% 高
+        max_w = int(sw * 0.85)
+        max_h = int(sh * 0.80)
+        self._base_scale = min(max_w / w, max_h / h, 1.0)
+        self._base_scale = max(0.3, self._base_scale)
+        self._base_w, self._base_h = w, h
+        # ★ 用户缩放倍数（默认 1.0 = 自动适配，滚轮可调）
+        self.zoom = 1.0
+        self._apply_zoom()
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=8, pady=(10, 4))
         tk.Label(top, text="选颜色 → 左键拖动画线 ｜ ⭐按住 Shift 拖动 = 画直线"
                            " ｜ 右键撤销 ｜ 平台画横线·绳子画竖线",
                  bg=BG, fg=TEXT_DIM, font=(FONT, 9)).pack(side="left")
+        # ★ 缩放控件
+        zoom_row = tk.Frame(self, bg=BG)
+        zoom_row.pack(fill="x", padx=8, pady=(0, 4))
+        tk.Label(zoom_row, text="缩放：", bg=BG, fg=TEXT_DIM,
+                 font=(FONT, 9)).pack(side="left")
+        NeoButton(zoom_row, "−", command=lambda: self._set_zoom(-0.25),
+                  padx=8, font=(FONT, 9)).pack(side="left")
+        self._zoom_label = tk.Label(zoom_row, text="100%", bg=BG, fg=ACCENT,
+                                     font=(MONO, 10, "bold"), width=5)
+        self._zoom_label.pack(side="left")
+        NeoButton(zoom_row, "+", command=lambda: self._set_zoom(+0.25),
+                  padx=8, font=(FONT, 9)).pack(side="left")
+        NeoButton(zoom_row, "适配", command=self._reset_zoom,
+                  padx=8, font=(FONT, 9), bg="#3a3f55", fg=TEXT).pack(
+            side="left", padx=(6, 0))
+        tk.Label(zoom_row, text="（鼠标滚轮也可缩放）",
+                 bg=BG, fg=TEXT_DIM, font=(FONT, 8)).pack(side="left", padx=(8, 0))
         main = tk.Frame(self, bg=BG)
         main.pack(fill="both", expand=True, padx=8, pady=4)
         # ---- 左侧色板 ----
@@ -87,7 +120,7 @@ class RoutePainter(tk.Toplevel):
         eraser.pack(pady=1)
         eraser.bind("<Button-1>", lambda e: self._pick(eraser, None))
         self._pick(self._swatches[0], self._color)
-        pw = tk.Frame(tools, bg=BG);
+        pw = tk.Frame(tools, bg=BG)
         pw.pack(pady=6)
         tk.Label(pw, text="笔宽", bg=BG, fg=TEXT_DIM, font=(FONT, 9)).pack(side="left")
         self._pen_var = tk.IntVar(value=2)
@@ -108,6 +141,13 @@ class RoutePainter(tk.Toplevel):
                                 highlightthickness=1, highlightbackground=BORDER,
                                 cursor="crosshair")
         self.canvas.pack(side="left")
+        # ★ 滚轮缩放（Windows 用 <MouseWheel>，Linux/Mac 分别用 <Button-4> / <Button-5>）
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        try:
+            self.canvas.bind("<Button-4>", lambda e: self._set_zoom(+0.15))
+            self.canvas.bind("<Button-5>", lambda e: self._set_zoom(-0.15))
+        except Exception:
+            pass
         self.canvas.bind("<Button-1>", self._down)  # 自由绘制
         self.canvas.bind("<Shift-Button-1>", self._down_line)  # 按住Shift=直线
         self.canvas.bind("<B1-Motion>", self._drag)
@@ -251,3 +291,32 @@ class RoutePainter(tk.Toplevel):
         self.destroy()
         if cb:
             cb(result)
+
+    def _apply_zoom(self):
+        """按 zoom 倍数重算 canvas 尺寸和坐标换算比"""
+        self.scale = self._base_scale * self.zoom
+        self.cw = int(self._base_w * self.scale)
+        self.ch = int(self._base_h * self.scale)
+        # 如果 canvas 已经存在，就更新尺寸和滚动区域
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.config(width=self.cw, height=self.ch,
+                               scrollregion=(0, 0, self.cw, self.ch))
+
+    def _set_zoom(self, delta):
+        """调整缩放（+0.25 或 -0.25），范围 0.25 ~ 5.0"""
+        self.zoom = max(0.25, min(5.0, self.zoom + delta))
+        self._apply_zoom()
+        self._zoom_label.config(text=f"{int(self.zoom * 100)}%")
+        self._render()
+
+    def _reset_zoom(self):
+        """复位到 100%（自动适配）"""
+        self.zoom = 1.0
+        self._apply_zoom()
+        self._zoom_label.config(text="100%")
+        self._render()
+
+    def _on_wheel(self, e):
+        """滚轮缩放：向上放大，向下缩小"""
+        delta = 0.15 if e.delta > 0 else -0.15
+        self._set_zoom(delta)
