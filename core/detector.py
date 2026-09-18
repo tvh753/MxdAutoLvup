@@ -21,19 +21,52 @@ from core.imio import imread_u
 
 
 class Template:
-    """单个识别模板（加载后缓存灰度图与尺寸）"""
+    """单个识别模板（加载后缓存灰度图 + 绿底掩膜）
+
+    ★ v22 新增：绿底掩膜（对齐参考项目 MapleStoryAutoLevelUp 的思路）
+      模板若为绿底素材（背景纯色 (0,255,0)），自动生成掩膜；
+      匹配时绿底像素不参与计算 → 草地/树叶/平台的绿都会被忽略，
+      误检率大幅下降，阈值可以拉高从而提高检出精度。
+      若模板不是绿底（用户自己截的图），自动跳过掩膜，行为与旧版一致。
+    """
+
+    # 绿底判定的颜色和容差
+    BG_BGR = (0, 255, 0)     # 纯绿（参考项目素材背景色）
+    BG_TOLERANCE = 60        # 三通道差值和容忍度，兼容 PNG/JPEG 压缩噪声
+    BG_MIN_RATIO = 0.20      # 绿底像素占比 ≥20% 才认为"是绿底模板"
 
     def __init__(self, name, path):
         self.name, self.path = name, path
-        img = imread_u(path, cv2.IMREAD_COLOR)  # 原 cv2.imread（中文路径安全版）
+        img = imread_u(path, cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"模板读取失败(文件不存在或解码异常): {path}")
-        # 同时缓存彩色图与灰度图：
-        #   - self.img  (BGR彩色): 供 find_pic 做彩色模板匹配使用
-        #   - self.gray (灰度):    供 find_all 做灰度匹配使用（更快、抗光照）
+        # 缓存彩色图与灰度图：
+        #   - self.img  (BGR彩色): 供 find_pic 做彩色匹配用
+        #   - self.gray (灰度):    供 find_all 做灰度匹配用
         self.img = img
         self.gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         self.h, self.w = self.gray.shape[:2]
+        # ★ 提取绿底掩膜（不是绿底模板则返回 None）
+        self.mask = self._extract_bg_mask(img)
+
+    @classmethod
+    def _extract_bg_mask(cls, img):
+        """从模板图提取"非背景"掩膜
+
+        返回:
+            numpy.ndarray | None: mask[i,j] = 255 (怪物像素) / 0 (绿底)
+                模板不是绿底时返回 None（调用方回退到无掩膜匹配）。
+        """
+        bg = np.array(cls.BG_BGR, dtype=np.int16)
+        diff = np.abs(img.astype(np.int16) - bg).sum(axis=2)
+        h, w = img.shape[:2]
+        total = max(1, h * w)
+        bg_count = int((diff <= cls.BG_TOLERANCE).sum())
+        if bg_count / total < cls.BG_MIN_RATIO:
+            return None  # 绿底占比太低 → 不是绿底模板
+        # 非绿底处 = 255，绿底处 = 0
+        mask = (diff > cls.BG_TOLERANCE).astype(np.uint8) * 255
+        return mask
 
 
 class TemplateDetector:
@@ -141,12 +174,31 @@ class TemplateDetector:
         if sh < tpl.h or sw < tpl.w:
             return []  # 画面比模板还小，肯定匹配不到
 
-        res = cv2.matchTemplate(scene_gray, tpl.gray, cv2.TM_CCOEFF_NORMED)
+        # ★ v22：模板有绿底掩膜时，绿底不参与匹配 —— 草地/树叶/平台的
+        #   绿色不会被误命中，误检率大幅下降。无掩膜时保持原有行为。
+        if tpl.mask is not None:
+            try:
+                res = cv2.matchTemplate(scene_gray, tpl.gray,
+                                        cv2.TM_CCOEFF_NORMED, mask=tpl.mask)
+            except cv2.error:
+                # 极端情况（如某些 OpenCV 版本 mask 要求同 dtype）→ 回退无掩膜
+                res = cv2.matchTemplate(scene_gray, tpl.gray,
+                                        cv2.TM_CCOEFF_NORMED)
+        else:
+            res = cv2.matchTemplate(scene_gray, tpl.gray, cv2.TM_CCOEFF_NORMED)
         ys, xs = np.where(res >= threshold)
-        # 收集所有超过阈值的候选框：[x, y, w, h, conf]
-        boxes = [[int(x) + offset[0], int(y) + offset[1], tpl.w, tpl.h, float(res[y, x])]
+        # ★ 关键优化：阈值放宽时 np.where 可能返回上千个点，
+        #   NMS 两两比较是 O(n²) → 上千点 = 几百毫秒。
+        #   先按分数取 top 50，NMS 就快了（怪物同屏最多十几只）。
+        if len(xs) > 50:
+            scores = res[ys, xs]
+            order = np.argsort(scores)[::-1][:50]
+            ys = ys[order]
+            xs = xs[order]
+        boxes = [[int(x) + offset[0], int(y) + offset[1],
+                  tpl.w, tpl.h, float(res[y, x])]
                  for x, y in zip(xs, ys)]
-        boxes = self._nms(boxes, 0.3)  # IoU>0.3 的重叠框合并为最高置信度的一个
+        boxes = self._nms(boxes, 0.3)
         boxes = sorted(boxes, key=lambda b: -b[4])[:max_results]
         return [(b[0] + b[2] // 2, b[1] + b[3] // 2, b[4], b[2], b[3]) for b in boxes]
 
