@@ -39,11 +39,14 @@ from gui.region_selector import RegionSelector
 # from gui.route_editor import RouteEditor
 # from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
 from core.bot_engine import BotEngine, Mode
-from core.window_capture import WindowCapture
+from core.window_capture import WindowCapture, VncCapture, FastWindowCapture
 from gui.route_painter import RoutePainter
 from core.map_manager import MapManager
 from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
-from core.imio import imwrite_u
+from core.imio import imread_u, imwrite_u
+from core.map_config import (
+    load_map_entries, find_by_name, find_by_package, MapConfigError,
+)
 
 class App(tk.Tk):
     """枫叶挂机控制台主窗口（tk.Tk 单例）
@@ -75,15 +78,32 @@ class App(tk.Tk):
         self._pill_state = None             # 状态胶囊缓存（变化才重绘）
 
         # 引擎：日志回调包装成 (时间戳, 消息, 级别) 入队，GUI 轮询取出
-        self.engine = BotEngine(self.cfg, lambda m, lv="info": self.log_queue.put(
-            (time.strftime("%H:%M:%S"), m, lv)))
+        def _log_fn(m, lv="info"):
+            print(f"[{time.strftime('%H:%M:%S')}][{lv}] {m}")
+            self.log_queue.put((time.strftime("%H:%M:%S"), m, lv))
+
+        self.engine = BotEngine(self.cfg, _log_fn)
+
         self.maps = MapManager(ROOT)
-        self._minimap_snap = None  # 当前小地图底图（录制）
-        self._route_img = None  # 当前颜色路线层
+        self._map_entries = []      # config_map.yaml 缓存
+        self._minimap_snap = None   # 当前小地图底图（录制）
+        self._route_imgs = []
+        self._route_img = None
+
+        # v27: 多路线 —— _route_imgs 是列表（长度 ≥1），
+        #       _route_img 保留作为"当前/最后一条"，兼容部分旧代码
+        self._route_imgs = []
+        self._route_img = None
         self.engine.start()  # 后台线程立刻启动（IDLE 模式空转等待）
 
         # 热键管理器需在 _build_layout 之前初始化（UI 会引用）
         self.hotkey_mgr = HotkeyManager(self)
+
+        # 小地图录制
+        self._recorder = None
+        self._rec_dialog = None
+        self._recorder_pack = ""
+        self._recorder_target_w = 0
 
         self._build_style()
         self._build_layout()
@@ -95,6 +115,7 @@ class App(tk.Tk):
         self._apply_hotkeys()
         self.protocol("WM_CLOSE_WINDOW", self._on_close)
         self.log("控制台就绪：① 绑定窗口 → ② 校准血蓝条/框选模板 → ③ 检查按键 → ④ ▶ 启动", "ok")
+
 
     # ================= 样式 =================
     def _build_style(self):
@@ -190,19 +211,117 @@ class App(tk.Tk):
         self._update_hotkey_label()
 
     def _build_target_tab(self, tab):
-        # 窗口绑定
-        box, body = self._section(tab, "🪟 窗口绑定")
-        box.pack(fill="x", padx=8, pady=(8, 4))
-        row = tk.Frame(body, bg=PANEL_2);
-        row.pack(fill="x")
-        self.win_combo = ttk.Combobox(row, state="readonly")
+        # ============ 抓屏模式选择 ============
+        mode_box, mode_body = self._section(tab, "🖥 抓屏模式")
+        mode_box.pack(fill="x", padx=8, pady=(8, 4))
+        self.capture_mode_var = tk.StringVar(
+            value=self.cfg.get("capture_mode", "window"))
+
+        def _on_mode_change():
+            mode = self.capture_mode_var.get()
+            self.cfg["capture_mode"] = mode
+            self.cfg_mgr.save()
+            # ★ 关键：通知引擎重建 capture / controller / move 三元组，
+            #   否则切回 window 模式时还挂着 VncCapture，点"绑定"会误走 VNC。
+            try:
+                self.engine.switch_capture_mode(mode)
+            except Exception as e:
+                self.log(f"切换抓屏模式失败: {e}", "error")
+            self._refresh_capture_ui()
+            # 断开旧连接 & 重置状态标签
+            if mode == "window":
+                self.win_label.config(text="未绑定", fg=TEXT_DIM)
+                self.log("抓屏模式：本机游戏（窗口句柄）", "info")
+            else:
+                self.vnc_label.config(text="未连接", fg=TEXT_DIM)
+                self.log("抓屏模式：虚拟机游戏（VNC）", "info")
+
+        mr = tk.Frame(mode_body, bg=PANEL_2); mr.pack(fill="x")
+        tk.Radiobutton(mr, text="🖥 本机游戏", variable=self.capture_mode_var,
+                       value="window", bg=PANEL_2, fg=TEXT, selectcolor="#141722",
+                       activebackground=PANEL_2, activeforeground=TEXT,
+                       font=(FONT, 9), command=_on_mode_change).pack(side="left")
+        tk.Radiobutton(mr, text="☁ 虚拟机游戏(VNC)", variable=self.capture_mode_var,
+                       value="vnc", bg=PANEL_2, fg=TEXT, selectcolor="#141722",
+                       activebackground=PANEL_2, activeforeground=TEXT,
+                       font=(FONT, 9), command=_on_mode_change).pack(
+            side="left", padx=(14, 0))
+
+        # ============ 切换容器（用 grid 叠放两个面板）============
+        # 关键：两个 box 放在同一个 grid cell，切换时用 grid_remove/grid，
+        # 比 pack/pack_forget 在 ScrollFrame 内更稳定，不会出现"框了但看不见"。
+        bind_holder = tk.Frame(tab, bg=PANEL)
+        bind_holder.pack(fill="x", padx=0, pady=0)
+        bind_holder.columnconfigure(0, weight=1)
+
+        # ---- 本机模式：窗口绑定 ----
+        self.win_bind_box, body = self._section(bind_holder, "🪟 窗口绑定")
+        self.win_bind_box.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 4))
+        # 第一行：ComboBox + 刷新按钮
+        #   ComboBox 用 expand=True 吃掉剩余宽度，⟳ 按钮固定在右侧
+        row1 = tk.Frame(body, bg=PANEL_2)
+        row1.pack(fill="x")
+        self.win_combo = ttk.Combobox(row1, state="readonly")
         self.win_combo.pack(side="left", fill="x", expand=True)
-        NeoButton(row, "⟳", command=self.refresh_windows, bg=PANEL, fg=TEXT,
+        NeoButton(row1, "⟳", command=self.refresh_windows, bg=PANEL, fg=TEXT,
                   padx=9).pack(side="left", padx=(6, 0))
-        NeoButton(row, "绑定", command=self.bind_window, padx=10).pack(side="left", padx=(6, 0))
-        self.win_label = tk.Label(body, text="未绑定", fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 9))
+        # 第二行：绑定 / 解绑
+        #   拆分到下一行避免横向控件过挤
+        row2 = tk.Frame(body, bg=PANEL_2)
+        row2.pack(fill="x", pady=(6, 0))
+        NeoButton(row2, "绑定", command=self.bind_window, padx=14).pack(side="left")
+        NeoButton(row2, "解绑", command=self.unbind_window,
+                  bg="#3a3f55", fg=TEXT, padx=14).pack(side="left", padx=(6, 0))
+
+        self.win_label = tk.Label(body, text="未绑定", fg=TEXT_DIM,
+                                  bg=PANEL_2, font=(FONT, 9))
         self.win_label.pack(anchor="w", pady=(4, 0))
         self.refresh_windows()
+
+        # ---- VNC 模式：连接配置 ----
+        self.vnc_bind_box, vnc_body = self._section(bind_holder,
+                                                    "☁ VNC 连接（虚拟机）")
+        self.vnc_bind_box.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 4))
+        vnc_cfg = self.cfg.setdefault("vnc", {})
+        r1 = tk.Frame(vnc_body, bg=PANEL_2); r1.pack(fill="x", pady=2)
+        tk.Label(r1, text="主机IP", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=8, anchor="w").pack(side="left")
+        self.vnc_host_entry = tk.Entry(r1, width=16, font=(MONO, 10))
+        self.vnc_host_entry.insert(0, vnc_cfg.get("host", "127.0.0.1"))
+        self.vnc_host_entry.pack(side="left")
+        self.vnc_host_entry.bind("<KeyRelease>", lambda e: self._save_vnc_cfg())
+
+        r2 = tk.Frame(vnc_body, bg=PANEL_2); r2.pack(fill="x", pady=2)
+        tk.Label(r2, text="端口", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=8, anchor="w").pack(side="left")
+        self.vnc_port_entry = tk.Entry(r2, width=16, font=(MONO, 10))
+        self.vnc_port_entry.insert(0, str(vnc_cfg.get("port", 5900)))
+        self.vnc_port_entry.pack(side="left")
+        self.vnc_port_entry.bind("<KeyRelease>", lambda e: self._save_vnc_cfg())
+
+        r3 = tk.Frame(vnc_body, bg=PANEL_2); r3.pack(fill="x", pady=2)
+        tk.Label(r3, text="密码", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                 width=8, anchor="w").pack(side="left")
+        self.vnc_pwd_entry = tk.Entry(r3, width=16, font=(MONO, 10))
+        self.vnc_pwd_entry.insert(0, vnc_cfg.get("password", ""))
+        self.vnc_pwd_entry.pack(side="left")
+        self.vnc_pwd_entry.bind("<KeyRelease>", lambda e: self._save_vnc_cfg())
+        tk.Label(vnc_body, text="（无密码留空即可）", fg=TEXT_DIM, bg=PANEL_2,
+                 font=(FONT, 8)).pack(anchor="w")
+
+        r4 = tk.Frame(vnc_body, bg=PANEL_2); r4.pack(fill="x", pady=(6, 0))
+        NeoButton(r4, "🔌 连接 VNC", command=self.bind_vnc, padx=12).pack(side="left")
+        NeoButton(r4, "🔌 断开", command=self.unbind_vnc, bg="#3a3f55",
+                  fg=TEXT, padx=10).pack(side="left", padx=(6, 0))
+        self.vnc_label = tk.Label(vnc_body, text="未连接", fg=TEXT_DIM,
+                                  bg=PANEL_2, font=(FONT, 9))
+        self.vnc_label.pack(anchor="w", pady=(4, 0))
+        tk.Label(vnc_body,
+                 text="多虚拟机预留：后续多线程多开时，可在 config.json 里配 vnc.multi",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(2, 0))
+
+        # 首次渲染：根据配置显示对应面板
+        self._refresh_capture_ui(force=True)
 
         # 模板
         box, body = self._section(tab, "👾 目标模板（怪物 / 玩家）")
@@ -256,17 +375,24 @@ class App(tk.Tk):
         # 地图包 & 颜色路线
         box, body = self._section(tab, "🗺 地图包 · 颜色路线（录制一次，处处复用）")
         box.pack(fill="x", padx=8, pady=(4, 8))
-        row = tk.Frame(body, bg=PANEL_2); row.pack(fill="x")
-        self.maps_combo = ttk.Combobox(row, state="readonly", width=8)
-        self.maps_combo.pack(side="left")
+        # 第一行：ComboBox + 刷新 + 新增
+        row = tk.Frame(body, bg=PANEL_2)
+        row.pack(fill="x")
+        self.maps_combo = ttk.Combobox(row, state="readonly")
+        self.maps_combo.pack(side="left", fill="x", expand=True)
         NeoButton(row, "⟳", command=self.refresh_maps, bg=PANEL, fg=TEXT,
-                  padx=8, font=(FONT, 9)).pack(side="left", padx=(3, 0))
-        NeoButton(row, "加载", command=self.load_map_pack, padx=9,
-                  font=(FONT, 9)).pack(side="left", padx=(3, 0))
-        NeoButton(row, "保存", command=self.save_map_pack, padx=9,
-                  font=(FONT, 9), bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(3, 0))
-        NeoButton(row, "删", command=self.delete_map_pack, padx=9,
-                  font=(FONT, 9), bg="#3a3f55", fg=TEXT).pack(side="left", padx=(3, 0))
+                  padx=9, font=(FONT, 9)).pack(side="left", padx=(3, 0))
+        NeoButton(row, "新增", command=self.create_map_pack, padx=9,
+                  font=(FONT, 9), bg="#2f6f8f", fg=TEXT).pack(side="left", padx=(3, 0))
+        # 第二行：加载 + 保存 + 删
+        row2 = tk.Frame(body, bg=PANEL_2)
+        row2.pack(fill="x", pady=(6, 0))
+        NeoButton(row2, "加载", command=self.load_map_pack, padx=14,
+                  font=(FONT, 9)).pack(side="left")
+        NeoButton(row2, "保存", command=self.save_map_pack, padx=14,
+                  font=(FONT, 9), bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(6, 0))
+        NeoButton(row2, "删除", command=self.delete_map_pack, padx=14,
+                  font=(FONT, 9), bg="#3a3f55", fg=TEXT).pack(side="left", padx=(6, 0))
         row2 = tk.Frame(body, bg=PANEL_2); row2.pack(fill="x", pady=(5, 0))
         NeoButton(row2, "🧭 校准小地图", command=self.calibrate_minimap,
                   padx=8, font=(FONT, 9)).pack(side="left")
@@ -275,6 +401,14 @@ class App(tk.Tk):
         row3 = tk.Frame(body, bg=PANEL_2); row3.pack(fill="x", pady=(5, 0))
         NeoButton(row3, "🎨 绘制路线", command=self.paint_route, padx=8,
                   font=(FONT, 9), bg="#2f6f4f", fg=TEXT).pack(side="left")
+        # v27: 新增 —— 追加一条路线（不清空已有的）
+        NeoButton(row3, "➕ 新增路线", command=self.paint_route_new, padx=8,
+                  font=(FONT, 9), bg="#2f6f4f", fg=TEXT).pack(side="left", padx=(4, 0))
+        # v27: 显示当前路线数
+        self.route_count_label = tk.Label(row3, text="路线: 0 条",
+                                          bg=PANEL_2, fg=TEXT_DIM,
+                                          font=(FONT, 8))
+        self.route_count_label.pack(side="left", padx=(8, 0))
         row4 = tk.Frame(body, bg=PANEL_2); row4.pack(fill="x", pady=(5, 0))
         self.patrol_var = tk.BooleanVar(
             value=self.cfg.get("patrol", {}).get("enabled", False))
@@ -288,6 +422,39 @@ class App(tk.Tk):
         self.patrol_label = tk.Label(body, text="", fg=TEXT_DIM, bg=PANEL_2,
                                      font=(FONT, 9))
         self.patrol_label.pack(anchor="w", pady=(4, 0))
+        # ============ 地图坐标偏移微调 ============
+        # 作用：小地图 → map 换算后，再叠加一个固定偏移
+        #   · X 正值 → 位置右移；负值 → 左移
+        #   · Y 正值 → 位置下移；负值 → 上移
+        # 每次改动立即写入 config 并热重载 route_nav（实时生效，便于调试）
+        row_off = tk.Frame(body, bg=PANEL_2)
+        row_off.pack(fill="x", pady=(5, 0))
+        tk.Label(row_off, text="坐标偏移", bg=PANEL_2, fg=TEXT,
+                 font=(FONT, 9)).pack(side="left")
+
+        p_off = self.cfg.setdefault("patrol", {})
+        cur_off = p_off.get("map_offset", [0, 0])
+        if not isinstance(cur_off, list) or len(cur_off) != 2:
+            cur_off = [0, 0]
+
+        self._off_x_entry = tk.Entry(row_off, width=6, font=(MONO, 10))
+        self._off_x_entry.insert(0, str(cur_off[0]))
+        self._off_x_entry.pack(side="left", padx=(4, 0))
+        self._off_x_entry.bind("<KeyRelease>",
+                               lambda e: self._apply_map_offset())
+
+        tk.Label(row_off, text="X ", bg=PANEL_2, fg=TEXT_DIM,
+                 font=(FONT, 8)).pack(side="left")
+
+        self._off_y_entry = tk.Entry(row_off, width=6, font=(MONO, 10))
+        self._off_y_entry.insert(0, str(cur_off[1]))
+        self._off_y_entry.pack(side="left")
+        self._off_y_entry.bind("<KeyRelease>",
+                               lambda e: self._apply_map_offset())
+
+        tk.Label(row_off, text="Y   (正=右下 负=左上)",
+                 bg=PANEL_2, fg=TEXT_DIM, font=(FONT, 8)).pack(
+            side="left", padx=(4, 0))
         self.refresh_maps()
         self.refresh_patrol_label()
 
@@ -346,24 +513,85 @@ class App(tk.Tk):
         self._hk_start_entry = KeyEntry(r1, value=hk_cfg.get("start_stop", "F8"),
                                         on_change=lambda v: self._set_hotkey("start_stop", v))
         self._hk_start_entry.pack(side="left")
-        r2 = tk.Frame(body3, bg=PANEL_2);
+        r2 = tk.Frame(body3, bg=PANEL_2)
         r2.pack(fill="x", pady=2)
         tk.Label(r2, text="暂停/继续", bg=PANEL_2, fg=TEXT, font=(FONT, 9),
                  width=10, anchor="w").pack(side="left")
         self._hk_pause_entry = KeyEntry(r2, value=hk_cfg.get("pause_resume", "F9"),
                                         on_change=lambda v: self._set_hotkey("pause_resume", v))
         self._hk_pause_entry.pack(side="left")
-        r3 = tk.Frame(body3, bg=PANEL_2);
-        r3.pack(fill="x", pady=4)
+        # ★ 启用全局热键的勾选框
+        #   要点：Checkbutton 不支持自动换行，长文本会被容器裁掉导致
+        #   勾选框都看不见。加 wraplength 让文本自动折行到第二行，
+        #   保证勾选框完整显示。
         self._hk_global_var = tk.BooleanVar(value=hk_cfg.get("global_enabled", False))
-        tk.Checkbutton(r3, text="启用全局热键（任意窗口焦点下生效，需 keyboard 库）",
-                       variable=self._hk_global_var,
-                       bg=PANEL_2, fg=TEXT, selectcolor="#141722",
-                       activebackground=PANEL_2, activeforeground=TEXT,
-                       font=(FONT, 9),
-                       command=lambda: self._set_hotkey_global()).pack(side="left")
+        tk.Checkbutton(
+            body3,
+            text="启用全局热键（任意窗口焦点下生效，需 pynput 库）",
+            variable=self._hk_global_var,
+            bg=PANEL_2, fg=TEXT, selectcolor="#141722",
+            activebackground=PANEL_2, activeforeground=TEXT,
+            font=(FONT, 9),
+            anchor="w", justify="left",
+            wraplength=270,          # ← 关键：让文字自动折行
+            command=lambda: self._set_hotkey_global(),
+        ).pack(fill="x", pady=4)
         tk.Label(body3, text="点击输入框→按键绑定；支持 F1-F12 或组合键如 ctrl+f8",
-                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(4, 0))
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8),
+                 wraplength=270, justify="left").pack(anchor="w", pady=(4, 0))
+        # ============ 定时按键（宠物药 + 5 BUFF）============
+        box4, body4 = self._section(tab, "🐾 定时按键（宠物药 / BUFF）")
+        box4.pack(fill="x", padx=8, pady=(0, 8))
+
+        # 每行：[标签] [按键输入] [间隔输入] 秒
+        timer_rows = [
+            ("宠物药", "pet_potion", 600),
+            ("BUFF1", "buff1", 180),
+            ("BUFF2", "buff2", 180),
+            ("BUFF3", "buff3", 180),
+            ("BUFF4", "buff4", 180),
+            ("BUFF5", "buff5", 180),
+        ]
+        self._timer_entries = {}
+        timers_cfg = self.cfg.setdefault("timers", {})
+        for label, key, default in timer_rows:
+            r = tk.Frame(body4, bg=PANEL_2)
+            r.pack(fill="x", pady=3)
+            tk.Label(r, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
+                     width=6, anchor="w").pack(side="left")
+
+            # 按键输入（复用 KeyEntry，自动处理键盘捕获）
+            ent_key = KeyEntry(r, value=self.cfg["keys"].get(key, ""),
+                               on_change=lambda v, k=key: self._set_key(k, v))
+            ent_key.pack(side="left")
+
+            # 间隔输入
+            tk.Label(r, text="  间隔", bg=PANEL_2, fg=TEXT_DIM,
+                     font=(FONT, 9)).pack(side="left")
+            ent_itv = tk.Entry(r, width=6, font=(MONO, 10))
+            ent_itv.insert(0, str(timers_cfg.get(key, default)))
+            ent_itv.pack(side="left")
+            ent_itv.bind("<KeyRelease>",
+                         lambda e, k=key, w=ent_itv: self._set_timer(k, w))
+            tk.Label(r, text="秒", bg=PANEL_2, fg=TEXT_DIM,
+                     font=(FONT, 9)).pack(side="left")
+
+        tk.Label(body4, text="按键留空 = 该功能禁用；间隔 ≥ 1 秒",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8)).pack(anchor="w", pady=(6, 0))
+
+        # ============ 保存按键配置到地图包 ============
+        box_save, body_save = self._section(tab, "💾 保存按键到地图包")
+        box_save.pack(fill="x", padx=8, pady=(0, 8))
+
+        NeoButton(body_save, "💾 写入当前地图包",
+                  command=self.save_keys_to_pack,
+                  bg="#2f6f5f", fg=TEXT).pack(anchor="w")
+        tk.Label(body_save,
+                 text="把当前面板的按键 + 攻击方式 + 定时按键，写入 "
+                      "maps/<地图包>/profile.json，加载地图包时自动恢复",
+                 fg=TEXT_DIM, bg=PANEL_2, font=(FONT, 8),
+                 wraplength=270, justify="left").pack(anchor="w", pady=(4, 0))
+
 
 
     def _build_param_tab(self, tab):
@@ -387,6 +615,7 @@ class App(tk.Tk):
         slider("蓝药阈值%", 10, 90, "mp_potion")
         slider("攻击距离px", 40, 400, "attack_range")
         slider("技能范围px", 80, 500, "skill_range")
+        slider("攻击框底偏移", -60, 120, "attack_bottom_offset")
         slider("追击距离px", 60, 500, "chase_range")
         slider("偏离容差px", 10, 60, "off_route_tol")
         slider("拾取间隔s", 0.1, 1.5, "pickup_interval")
@@ -399,7 +628,9 @@ class App(tk.Tk):
                            ("jump_while_roam", "巡逻时随机跳跃"),
                            ("stop_on_low_hp", "血量过低自动停机保护"),
                            ("pause_on_unfocus", "游戏失焦时暂停按键（推荐开启）"),
-                           ("loot_enabled", "边走边自动拾取（需配置拾取按键）"),]:
+                           ("loot_enabled", "边走边自动拾取（需配置拾取按键）"),
+                           ("preview_enabled", "显示实时识别画面（关闭可省 CPU，多开建议关）"),
+                           ("nav_panel_enabled", "显示 NAV 小地图面板（关闭可再省一点）")]:
             var = tk.BooleanVar(value=self.cfg["options"].get(key, False))
             tk.Checkbutton(body2, text=label, variable=var, bg=PANEL_2, fg=TEXT,
                            selectcolor="#141722", activebackground=PANEL_2,
@@ -411,7 +642,7 @@ class App(tk.Tk):
         box3.pack(fill="x", padx=8, pady=(0, 8))
         def pslider(label, frm, to, key, default, fmt="{:.0f}"):
             p = self.cfg.setdefault("patrol", {})
-            row = tk.Frame(body3, bg=PANEL_2);
+            row = tk.Frame(body3, bg=PANEL_2)
             row.pack(fill="x", pady=3)
             tk.Label(row, text=label, bg=PANEL_2, fg=TEXT, font=(FONT, 9),
                      width=9, anchor="w").pack(side="left")
@@ -424,10 +655,10 @@ class App(tk.Tk):
             sc.pack(side="left", fill="x", expand=True, padx=(4, 8))
             sc.bind("<ButtonRelease-1>", lambda e: (self.cfg_mgr.save(),
                                                     self.engine.reload_runtime()))
-        pslider("搜索半径", 4, 25, "search_range", 10)
+        pslider("搜索半径", 5, 25, "search_range", 10)
         pslider("抓绳容差", 2, 10, "grab_tol", 4)
         pslider("玩家点面积", 12, 120, "dot_max_area", 40)
-        pslider("追击时限s", 1.0, 10.0, "max_chase_time", 4.0, "{:.1f}")
+        pslider("追击时限s", 1.0, 10.0, "max_chase_time", 3.0, "{:.1f}")
 
         box4, body4 = self._section(tab, "⏱ 挂机时长（到点休息，自动循环）")
         box4.pack(fill="x", padx=8, pady=(0, 8))
@@ -571,8 +802,53 @@ class App(tk.Tk):
                 self.win_combo.current(i)
                 break
 
+    def create_map_pack(self):
+        """创建空地图包（同时写入 config_map.yaml，下拉立刻可见）"""
+        name = (simpledialog.askstring(
+            "新建地图包",
+            "输入地图包名称（字母/数字/下划线/中文）：\n"
+            "创建后需手动把 map.png 放到该目录",
+            parent=self) or "").strip()
+        if not name:
+            return
+        import re
+        if not re.match(r'^[\w\u4e00-\u9fa5]+$', name):
+            messagebox.showerror("错误",
+                                 "名称只能含字母、数字、下划线、中文", parent=self)
+            return
+
+        try:
+            ok = self.maps.create(name)     # ★ create 内部已写 yaml
+        except Exception as e:
+            messagebox.showerror("错误", f"创建失败: {e}", parent=self)
+            return
+        if not ok:
+            messagebox.showwarning("提示", f"地图包「{name}」已存在", parent=self)
+            return
+
+        pack_dir = os.path.join(self.maps.maps_dir, name)
+        self.refresh_maps()                 # ★ 刷新下拉列表（读 yaml）
+        self.maps_combo.set(name)           # 自动选中新建的
+        self.log(f"📦 地图包「{name}」已创建：{pack_dir}", "ok")
+        messagebox.showinfo(
+            "创建成功",
+            f"地图包「{name}」已创建。\n\n"
+            f"请把完整地图放到：\n{pack_dir}\\map.png\n\n"
+            f"然后：加载 → 校准小地图 → 绘制路线 → 保存",
+            parent=self)
+
     def bind_window(self):
         """绑定所选游戏窗口 → 进入预览监控模式"""
+        if self.cfg.get("capture_mode") == "vnc":
+            messagebox.showinfo(
+                "提示",
+                "当前是【虚拟机游戏(VNC)】模式，请点「🔌 连接 VNC」，"
+                "切到【本机游戏】才会绑定窗口",
+                parent=self)
+            return
+        # 防御：确保引擎侧 capture 是 Window 系（Fast 或旧版都行）
+        if not isinstance(self.engine.capture, (WindowCapture, FastWindowCapture)):
+            self.engine.switch_capture_mode("window")
         title = self.win_combo.get()
         if not title:
             messagebox.showwarning("提示", "请先选择游戏窗口", parent=self)
@@ -586,6 +862,78 @@ class App(tk.Tk):
         else:
             self.win_label.config(text="❌ 绑定失败", fg=RED)
             self.log("窗口绑定失败", "error")
+
+    def unbind_window(self):
+        """解绑当前游戏窗口"""
+        if not self.engine.window_bound():
+            self.log("当前未绑定窗口", "info")
+            return
+        if not messagebox.askyesno("确认", "确定解绑当前游戏窗口？",
+                                   parent=self):
+            return
+        if self.engine.unbind_window():
+            self.win_label.config(text="未绑定", fg=TEXT_DIM)
+            self.log("窗口已解绑，可重新绑定", "ok")
+        else:
+            self.log("解绑失败", "error")
+
+    def _save_vnc_cfg(self):
+        """VNC 表单 → config 并落盘"""
+        vnc_cfg = self.cfg.setdefault("vnc", {})
+        vnc_cfg["host"] = self.vnc_host_entry.get().strip() or "127.0.0.1"
+        try:
+            vnc_cfg["port"] = int(self.vnc_port_entry.get().strip())
+        except (ValueError, AttributeError):
+            vnc_cfg["port"] = 5900
+        vnc_cfg["password"] = self.vnc_pwd_entry.get()
+        self.cfg_mgr.save()
+
+    def _refresh_capture_ui(self, force=False):
+        """按 capture_mode 显示对应面板（grid_remove / grid 切换）"""
+        mode = self.cfg.get("capture_mode", "window")
+        if not force and getattr(self, "_capture_ui_shown", None) == mode:
+            return
+        self._capture_ui_shown = mode
+        if mode == "vnc":
+            self.win_bind_box.grid_remove()
+            self.vnc_bind_box.grid()
+        else:
+            self.vnc_bind_box.grid_remove()
+            self.win_bind_box.grid()
+
+    def bind_vnc(self):
+        """连接 VNC 虚拟机"""
+        self._save_vnc_cfg()
+        # 防御：确保引擎侧 capture 是 VncCapture
+        if not isinstance(self.engine.capture, VncCapture):
+            self.engine.switch_capture_mode("vnc")
+        v = self.cfg.get("vnc", {})
+        host = v.get("host", "127.0.0.1")
+        port = v.get("port", 5900)
+        pwd = v.get("password") or None
+        ok = self.engine.switch_capture_mode("vnc", host=host, port=port,
+                                             password=pwd)
+        # 上面那次只重建，现在真正触发连接
+        kw = f"{host}:{port}"
+        if self.engine.capture.bind(kw):
+            self.engine.reload_runtime()
+            self.engine.set_mode(Mode.PREVIEW)
+            self.vnc_label.config(text=f"✅ 已连接 {host}:{port}", fg=GREEN)
+            self.log(f"VNC 已连接：{host}:{port}，"
+                     f"分辨率 {self.engine.capture.size}", "ok")
+        else:
+            self.vnc_label.config(text=f"❌ 连接失败 {host}:{port}", fg=RED)
+            self.log(f"VNC 连接失败：{host}:{port}"
+                     f"（检查服务是否开启/端口/密码）", "error")
+
+    def unbind_vnc(self):
+        """断开 VNC 连接"""
+        try:
+            self.engine._close_capture()
+        except Exception:
+            pass
+        self.vnc_label.config(text="未连接", fg=TEXT_DIM)
+        self.log("VNC 连接已断开", "warn")
 
     def _grab_frame(self):
         """取一帧画面：优先实时截图（框选/录制需要当前画面），失败回退引擎缓存帧"""
@@ -675,6 +1023,47 @@ class App(tk.Tk):
         RegionSelector(self, frame, mode="region", on_ok=ok,
                        tip="框选角色本体（站直、无遮挡、背景简洁处）")
 
+    def calibrate_offset(self):
+        """手动标定 offset（站在地图上能识别的位置点按钮）"""
+        if not self.engine.window_bound():
+            messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self)
+            return
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        if not name:
+            messagebox.showwarning("提示", "请先加载地图包", parent=self)
+            return
+        result = self.engine.calibrate_offset()
+        if result is None:
+            messagebox.showerror(
+                "标定失败",
+                "可能原因：\n"
+                "1. 名字条未匹配（玩家被遮挡/离屏幕边缘）\n"
+                "2. 小块地形匹配分数 < 0.15\n"
+                "3. map.png 与当前地图不一致",
+                parent=self)
+            return
+        offset, score, scale = result
+        p = self.cfg.setdefault("patrol", {})
+        p["offset"] = [round(float(offset[0]), 1), round(float(offset[1]), 1)]
+        self.cfg_mgr.save()
+        # ★ 写入地图包 profile.json
+        try:
+            self.maps.update_profile(name, {
+                "patrol": {"offset": p["offset"]},
+            })
+        except Exception as e:
+            self.log(f"offset 写入地图包失败: {e}", "warn")
+        # 立即生效
+        self.engine.route_nav.configure(offset=p["offset"])
+        self.log(f"✓ 标定完成 offset=({offset[0]:.0f},{offset[1]:.0f}) "
+                 f"score={score:.2f} s={scale:.2f}", "ok")
+        messagebox.showinfo(
+            "标定成功",
+            f"offset = ({offset[0]:.0f}, {offset[1]:.0f})\n"
+            f"score = {score:.2f}\nscale = {scale:.2f}\n\n"
+            f"已保存到地图包「{name}」",
+            parent=self)
+
     def clear_player(self):
         self.cfg["player_template"] = None
         if self.maps.player_exists():
@@ -759,6 +1148,16 @@ class App(tk.Tk):
         """patrol 配置节（不存在则自动补默认空字典）"""
         return self.cfg.setdefault("patrol", {})
 
+    # ---------- 多路线辅助 ----------
+    def _route_count(self):
+        """当前已加载的路线数（0 = 无路线）"""
+        return len([r for r in self._route_imgs if r is not None])
+
+    def _sync_route_img(self):
+        """把 _route_imgs 同步到 _route_img（指向最后一条）"""
+        valid = [r for r in self._route_imgs if r is not None]
+        self._route_img = valid[-1] if valid else None
+
     def calibrate_minimap(self):
         """校准小地图：框选地图区域 → 多帧采样玩家黄点颜色 → 顺手录制底图"""
         frame = self._grab_frame()
@@ -782,143 +1181,414 @@ class App(tk.Tk):
             self.log(f"小地图校准完成 ({w}×{h})"
                      + (f" · 玩家点颜色已采样 {color}" if color
                         else " · 未检出黄点，使用默认黄色，可稍后重新校准"), "ok")
-            self.record_minimap()  # 校准后顺手录制底图
-
+            self._quick_snapshot()  # ★ 改成快照
         RegionSelector(self, frame, mode="region", on_ok=ok,
                        tip="框选小地图的【地图区域】（不含标题文字，尽量贴紧边界）")
 
     # ---------- 地图包 / 颜色路线 ----------
     def refresh_maps(self):
-        maps = self.maps.list_maps()
-        self.maps_combo["values"] = maps
-        cur = self.cfg.get("patrol", {}).get("current_map", "")
-        if cur in maps:
-            self.maps_combo.set(cur)
-        elif maps:
+        """刷新地图配置下拉列表（数据源：config/config_map.yaml）
+
+        · 下拉里显示的是 YAML 里的配置名 name
+        · cfg['patrol']['current_map'] 里存的仍是 package（目录名），
+          所以要用 find_by_package 反查回名字来 set()
+        """
+        try:
+            self._map_entries = load_map_entries()
+        except MapConfigError as e:
+            self._map_entries = []
+            self.maps_combo["values"] = []
+            self.maps_combo.set("")
+            self.log(f"⚠ 地图配置读取失败: {e}", "warn")
+            return
+
+        names = [e.name for e in self._map_entries]
+        self.maps_combo["values"] = names
+
+        # 反查：current_map（package 目录名）→ 配置名
+        cur_pack = self.cfg.get("patrol", {}).get("current_map", "")
+        cur_name = ""
+        if cur_pack:
+            e = find_by_package(cur_pack, self._map_entries)
+            if e:
+                cur_name = e.name
+
+        if cur_name and cur_name in names:
+            self.maps_combo.set(cur_name)
+        elif names:
             self.maps_combo.current(0)
 
-    def record_minimap(self):
-        """录制小地图底图：裁剪当前帧 → 存入 _minimap_snap → 注入引擎滚动补偿"""
+    def _quick_snapshot(self):
+        """校准后抓一帧小地图，直接作为 map.png
+
+        适用于"小地图显示整张地图"的情况（火焰之地V、蘑菇山等）。
+        滚动小地图请用「🎬 录制小地图」走一圈。
+        """
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        if not name:
+            return
         mm = self.cfg.get("patrol", {}).get("minimap", {})
         if mm.get("w", 0) < 5:
-            messagebox.showwarning("提示", "请先「校准小地图」", parent=self)
             return
         frame = self._grab_frame()
         if frame is None:
             return
-        self._minimap_snap = frame[mm["y"]:mm["y"] + mm["h"],
-                             mm["x"]:mm["x"] + mm["w"]].copy()
-        if self._route_img is not None and \
-                self._route_img.shape != self._minimap_snap.shape:
-            self._route_img = None  # 尺寸变了，旧路线作废
-
-        self.engine.set_nav_base(self._minimap_snap)
-        pack = self._active_pack()
-        if pack:
-            self.maps.save_minimap(pack, self._minimap_snap)
-            self.log(f"小地图底图已录制并写入地图包「{pack}」"
-                     f"({mm['w']}×{mm['h']})", "ok")
+        mini = frame[mm["y"]:mm["y"] + mm["h"],
+                     mm["x"]:mm["x"] + mm["w"]].copy()
+        out = os.path.join(self.maps.maps_dir, name, "map.png")
+        ok, buf = cv2.imencode(".png", mini)
+        if ok:
+            buf.tofile(out)
+            self.log(f"📸 已快照小地图为 map.png（{mm['w']}x{mm['h']}）", "ok")
+            self.engine.invalidate_route_cache()
+            self.engine.reload_runtime()
         else:
-            self.log(f"小地图底图已录制 ({mm['w']}×{mm['h']})，可「绘制颜色路线」", "ok")
+            self.log("❌ 快照保存失败", "error")
+
+    def record_minimap(self):
+        """录制小地图（滚动拼图，用于小地图会滚动的长地图）
+
+        走一圈 → 拼成大图 → 写入 map.png
+        """
+        if not self.engine.window_bound():
+            messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self)
+            return
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        if not name:
+            messagebox.showwarning("提示", "请先加载地图包", parent=self)
+            return
+        mm = self.cfg.get("patrol", {}).get("minimap", {})
+        if mm.get("w", 0) < 5:
+            messagebox.showwarning("提示", "请先「校准小地图」", parent=self)
+            return
+
+        from core.map_recorder import MapRecorder
+
+        roi = (mm["x"], mm["y"], mm["w"], mm["h"])
+        color = self.cfg.get("patrol", {}).get("player_dot_color", [0, 128, 255])
+        self._recorder = MapRecorder(
+            capture=self.engine.capture,   # ★ 复用 engine 的
+            roi=roi,
+            player_color=color,
+            log_fn=self.log)
+        self._recorder.start()
+        self._recorder_pack = name
+        self._recorder_target_w = int(mm["w"])
+
+        self._rec_dialog = tk.Toplevel(self)
+        self._rec_dialog.title("录制地图")
+        self._rec_dialog.configure(bg=PANEL)
+        self._rec_dialog.geometry("320x160")
+        self._rec_dialog.transient(self)
+        # ★ 不用 grab_set，避免阻塞主循环
+
+        tk.Label(self._rec_dialog, text="🎬 录制中…",
+                 bg=PANEL, fg=ACCENT, font=(FONT, 12, "bold")).pack(pady=(15, 5))
+        self._rec_info = tk.Label(self._rec_dialog,
+                                   text="请在游戏里走一圈，把地图走遍",
+                                   bg=PANEL, fg=TEXT, font=(FONT, 10))
+        self._rec_info.pack(pady=5)
+
+        btn_row = tk.Frame(self._rec_dialog, bg=PANEL)
+        btn_row.pack(pady=10)
+        NeoButton(btn_row, "💾 保存", command=self._stop_recording,
+                  bg="#2f6f4f", fg=TEXT).pack(side="left", padx=4)
+        NeoButton(btn_row, "✖ 取消", command=self._cancel_recording,
+                  bg="#3a3f55", fg=TEXT).pack(side="left", padx=4)
+
+        self._poll_recorder()
+
+    def _poll_recorder(self):
+        """每 500ms 刷新录制进度"""
+        if not hasattr(self, "_recorder") or self._recorder is None:
+            return
+        if not self._recorder.is_alive():
+            return
+        n = self._recorder.frame_count
+        cw, ch = self._recorder.canvas_size()
+        self._rec_info.config(text=f"已采集 {n} 帧\n画布 {cw}×{ch}")
+        self.after(500, self._poll_recorder)
+
+    def _stop_recording(self):
+        """停止录制并保存"""
+        rec = getattr(self, "_recorder", None)
+        if rec is None:
+            return
+        rec.stop()
+        rec.join(timeout=2)
+        pack = getattr(self, "_recorder_pack", "")
+        target_w = getattr(self, "_recorder_target_w", 93)
+        from core.config_manager import ROOT
+        out = os.path.join(self.maps.maps_dir, pack, "map.png")
+        ok = rec.save(out, target_w)
+        if ok:
+            self.log(f"✅ 拼图已保存: {out}", "ok")
+        else:
+            self.log("❌ 保存失败", "error")
+        self._recorder = None
+        try:
+            self._rec_dialog.destroy()
+        except Exception:
+            pass
+        # 重新加载地图包
+        self.engine.invalidate_route_cache()
+        self.engine.reload_runtime()
+
+    def _cancel_recording(self):
+        """取消录制"""
+        rec = getattr(self, "_recorder", None)
+        if rec is not None:
+            rec.stop()
+            self._recorder = None
+        try:
+            self._rec_dialog.destroy()
+        except Exception:
+            pass
+        self.log("录制已取消", "warn")
+
 
     def paint_route(self):
-        """打开颜色路线绘制器：绘制完成后直接加载到引擎（有地图包则落盘）"""
-        if self._minimap_snap is None:  # 尝试从当前地图包取底图
-            name = self.cfg.get("patrol", {}).get("current_map", "")
-            if name:
-                self._minimap_snap = self.maps.load_minimap(name)
-        if self._minimap_snap is None:
-            messagebox.showwarning("提示", "请先「录制小地图」", parent=self)
+        """打开颜色路线绘制器（v3：底图 = map.png，大窗口绘制）
+
+        · 底图：从当前地图包加载 map.png
+        · 已有路线：作为初始图传入，可二次编辑
+        · 覆盖模式：画完后整体替换（追加请用「➕ 新增路线」）
+        """
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        if not name:
+            messagebox.showwarning("提示", "请先选择/加载地图包", parent=self)
+            return
+
+        # ★ 从地图包加载底图（wz 原图自动缩放）
+        mm = self.cfg.get("patrol", {}).get("minimap", {})
+        pack_dir = os.path.join(self.maps.maps_dir, name)
+        map_img = self.engine._load_map_for_pack(pack_dir, mm)
+        if map_img is None:
+            messagebox.showwarning(
+                "提示",
+                f"地图包「{name}」里没有可用的底图\n\n"
+                f"请放入以下任一文件:\n"
+                f"  · {pack_dir}\\minimap_wz.png（推荐，wz 原图）\n"
+                f"  · {pack_dir}\\map.png（旧格式）",
+                parent=self)
             return
 
         def ok(route_img):
-            self._route_img = route_img
-            name = self.cfg.get("patrol", {}).get("current_map", "")
-            if name:  # 已关联地图包 → 直接落盘
-                rp = os.path.join(self.maps.maps_dir, name, "route.png")
-                self.maps.save_route(name, route_img)
-                self.cfg.setdefault("patrol", {})["route_path"] = rp
-                self.cfg_mgr.save()
-                self.engine.load_route(route_img, path_tag=rp)
-                if self._minimap_snap is not None:
-                    self.engine.set_nav_base(self._minimap_snap)
-                self.log(f"路线已保存到地图包「{name}」", "ok")
-            else:
-                self.engine.load_route(route_img)
-                self.log("路线已生效（存为地图包后可持久复用）", "ok")
+            # 覆盖模式：整份替换
+            self._route_imgs = [route_img]
+            self._sync_route_img()
+            rp = os.path.join(self.maps.maps_dir, name, "route.png")
+            self.maps.save_route(name, self._route_imgs)
+            self.cfg.setdefault("patrol", {})["route_path"] = rp
+            self.cfg_mgr.save()
+            self.engine.load_route(self._route_imgs, path_tag=rp)
+            self._update_route_label()
             self.refresh_patrol_label()
+            self.log(f"🎨 路线已保存到地图包「{name}」", "ok")
 
-        RoutePainter(self, self._minimap_snap, self._route_img, on_ok=ok)
+        # 传入已有路线（若有），便于二次编辑
+        initial_route = self._route_img if self._route_img is not None else None
+        if initial_route is not None and \
+                initial_route.shape[:2] != map_img.shape[:2]:
+            # 尺寸不匹配（旧路线）→ 丢弃
+            initial_route = None
+        RoutePainter(self, map_img, initial_route, on_ok=ok)
+
+    def paint_route_new(self):
+        """新增一条路线（追加到现有列表，不清空已有）"""
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        if not name:
+            messagebox.showwarning("提示", "请先选择/加载地图包", parent=self)
+            return
+
+        mm = self.cfg.get("patrol", {}).get("minimap", {})
+        pack_dir = os.path.join(self.maps.maps_dir, name)
+        map_img = self.engine._load_map_for_pack(pack_dir, mm)
+        if map_img is None:
+            messagebox.showwarning(
+                "提示",
+                f"地图包「{name}」里没有可用的底图\n\n"
+                f"请放入以下任一文件:\n"
+                f"  · {pack_dir}\\minimap_wz.png\n"
+                f"  · {pack_dir}\\map.png",
+                parent=self)
+            return
+
+        def ok(route_img):
+            # 追加模式
+            self._route_imgs.append(route_img)
+            self._sync_route_img()
+            rp = os.path.join(self.maps.maps_dir, name, "route.png")
+            self.maps.save_route(name, self._route_imgs)
+            self.cfg.setdefault("patrol", {})["route_path"] = rp
+            self.cfg_mgr.save()
+            self.engine.load_route(self._route_imgs, path_tag=rp)
+            self._update_route_label()
+            self.refresh_patrol_label()
+            self.log(f"🎨 新增路线 → 地图包「{name}」共 "
+                     f"{self._route_count()} 条", "ok")
+
+        # 新增：空白底图（从零画）
+        RoutePainter(self, map_img, None, on_ok=ok)
+
+    def _update_route_label(self):
+        """刷新「路线: N 条」标签"""
+        if hasattr(self, "route_count_label"):
+            n = self._route_count()
+            self.route_count_label.config(
+                text=f"路线: {n} 条",
+                fg=TEXT if n > 0 else TEXT_DIM)
 
     def save_map_pack(self):
-        """把「配置 + 底图 + 颜色路线 + 怪物模板」整体保存成地图包"""
-        name = self.maps_combo.get().strip()
-        if not name:
-            name = (simpledialog.askstring("地图包命名", "地图名称（如：蘑菇山）：",
-                                           parent=self) or "").strip()
+        """保存当前配置到地图包。
+
+        ★ 与 config_map.yaml 联动：
+          · 输入的名称在 YAML 中   → 保存到该配置映射的 package 目录
+          · 输入的名称不在 YAML 中 → 按旧行为，直接用名称做目录名
+        """
+        default_name = self.maps_combo.get().strip() or \
+                       self.cfg.get("patrol", {}).get("current_map", "")
+
+        name = (simpledialog.askstring(
+            "保存地图包",
+            "输入地图配置名：\n"
+            "· 在 config_map.yaml 中已存在 → 保存到对应地图包目录\n"
+            "· 新名称 → 若不在 YAML 中，将直接作为目录名（建议顺手加进 YAML）",
+            initialvalue=default_name, parent=self) or "").strip()
         if not name:
             return
-        if name in self.maps.list_maps() and not messagebox.askyesno(
-                "覆盖确认", f"地图包「{name}」已存在，覆盖保存？", parent=self):
+
+        # ---- 解析配置名 → 包目录名 ----
+        try:
+            entries = self._map_entries or load_map_entries()
+        except MapConfigError:
+            entries = []
+        entry = find_by_name(name, entries)
+        pack = entry.package if entry else name  # ★ 关键：目录名
+
+        if pack in self.maps.list_maps() and not messagebox.askyesno(
+                "覆盖确认", f"地图包「{pack}」已存在，覆盖保存？", parent=self):
             return
+
         mm = self.cfg.get("patrol", {}).get("minimap", {})
         if mm.get("w", 0) < 5:
             messagebox.showwarning("提示", "请先「🧭 校准小地图」再保存地图包",
                                    parent=self)
             return
         try:
-            self.maps.save(name, self.cfg, self._minimap_snap, self._route_img,
-                           grab_fn=lambda: self._grab_frame())  # 缺底图自动补拍
+            # ★ 保证 config_map.yaml 里有这个目录（老包补录）
+            try:
+                self.maps.add_yaml_entry(name, package=pack)
+            except Exception as e:
+                self.log(f"config_map.yaml 写入失败: {e}", "warn")
+            self.maps.save(pack, self.cfg, self._minimap_snap, self._route_imgs,
+                           grab_fn=lambda: self._grab_frame())
         except Exception as e:
             self.log(f"地图包保存失败: {e}", "error")
             messagebox.showerror("错误", f"地图包保存失败：{e}", parent=self)
             return
-        # 回填：底图可能被自动补拍；路线可能来自包内旧图
-        mm_img = self.maps.load_minimap(name)
-        if mm_img is not None:
-            self._minimap_snap = mm_img  # ← 不能用 or，数组真值歧义
-        if self._route_img is None:
-            self._route_img = self.maps.load_route(name)
 
-        if self._route_img is None:
-            self._route_img = self.maps.load_route(name)
+        # 回填
+        mm_img = self.maps.load_minimap(pack)
+        if mm_img is not None:
+            self._minimap_snap = mm_img
+        if not self._route_imgs:
+            self._route_imgs = self.maps.load_route(pack) or []
+            self._sync_route_img()
         if self._minimap_snap is not None:
             self.engine.set_nav_base(self._minimap_snap)
+
         p = self.cfg.setdefault("patrol", {})
-        p["current_map"] = name
-        p["route_path"] = os.path.join(self.maps.maps_dir, name, "route.png")
+        p["current_map"] = pack  # ★ 存包目录名
+        p["route_path"] = os.path.join(self.maps.maps_dir, pack, "route.png")
         p["enabled"] = True
         self.cfg_mgr.save()
         self.engine.reload_runtime()
         self.refresh_maps()
         self.refresh_patrol_label()
         self.patrol_var.set(True)
-        self.log(f"🗺 地图包「{name}」已保存：绑定怪物 "
+        self.log(f"🗺 地图包「{pack}」已保存（配置名「{name}」）：绑定怪物 "
                  f"{len(self.cfg.get('monster_templates', []))} 个 · "
                  f"底图{'✓' if self._minimap_snap is not None else '✗(未绑定窗口无法补拍)'} · "
-                 f"路线{'✓' if self._route_img is not None else '✗'}，巡逻已启用", "ok")
+                 f"路线{self._route_count()}条，巡逻已启用", "ok")
 
     def load_map_pack(self):
-        """加载地图包：恢复该地图全部配置并同步 UI 控件，缺底图自动补拍"""
-        name = self.maps_combo.get()
-        if not name:
-            messagebox.showwarning("提示", "请先选择地图包", parent=self)
+        """加载地图配置：config_map.yaml 的 配置名 → maps/<package>/
+
+        ★ 校验 map.png 必须存在：maps/<package>/map.png
+        """
+        sel = self.maps_combo.get().strip()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择地图配置", parent=self)
             return
+
+        # ---- 解析配置名 → 地图包目录名 ----
+        if not self._map_entries:
+            try:
+                self._map_entries = load_map_entries()
+            except MapConfigError as e:
+                messagebox.showerror("错误", f"地图配置读取失败：\n{e}", parent=self)
+                return
+        entry = find_by_name(sel, self._map_entries)
+        if entry is None:
+            messagebox.showerror(
+                "错误",
+                f"配置「{sel}」未在 config_map.yaml 中找到\n"
+                f"请检查 config/config_map.yaml 里的 name 字段",
+                parent=self)
+            return
+        name = entry.package  # ★ 关键：映射到实际目录名
+
+        # ---- ★ 校验底图存在（wz 原图 或 map.png 任一）----
+        pack_dir = os.path.join(self.maps.maps_dir, name)
+        wz_png = os.path.join(pack_dir, "minimap_wz.png")
+        map_png = os.path.join(pack_dir, "map.png")
+        if not os.path.isfile(wz_png) and not os.path.isfile(map_png):
+            messagebox.showerror(
+                "错误",
+                f"地图包「{name}」缺少底图\n\n"
+                f"请放入以下任一文件:\n"
+                f"  · {wz_png}（推荐，wz 原图）\n"
+                f"  · {map_png}（旧格式）",
+                parent=self)
+            self.log(f"❌ 缺少底图: {pack_dir}", "error")
+            return
+
+        # ================= 以下是原有的加载逻辑（未改动） =================
         self.engine.invalidate_route_cache()
         ok, missing = self.maps.load(name, self.cfg)
+        # ★ 强制设置 current_map（profile 里可能没有这个字段）
+        self.cfg.setdefault("patrol", {})["current_map"] = name
+
+        # ★ 从 profile.json 恢复按键 / 定时按键
+        prof = self.maps.read_profile(name)
+        if prof:
+            keys = prof.get("keys")
+            if isinstance(keys, dict):
+                for k, v in keys.items():
+                    if k in self.cfg["keys"]:
+                        self.cfg["keys"][k] = v
+            timers = prof.get("timers")
+            if isinstance(timers, dict):
+                self.cfg.setdefault("timers", {}).update(timers)
+            # 同步刷新 UI 控件
+            for k, ent in self._key_entries.items():
+                ent.var.set(self.cfg["keys"].get(k, ""))
+
         if not ok:
             messagebox.showerror("错误", "地图包加载失败（profile.json 缺失）",
                                  parent=self)
             return
         self._minimap_snap = self.maps.load_minimap(name)
-        self._route_img = self.maps.load_route(name)
-        # 自愈：底图缺失 → 窗口已绑定且 ROI 有效则现场补拍写回包
+        self._route_imgs = self.maps.load_route(name) or []
+        self._sync_route_img()
+        # 底图缺失现场补拍
         if self._minimap_snap is None:
             mm = self.cfg.get("patrol", {}).get("minimap", {})
             frame = self._grab_frame() if mm.get("w", 0) > 4 else None
             if frame is not None:
                 self._minimap_snap = frame[mm["y"]:mm["y"] + mm["h"],
-                                     mm["x"]:mm["x"] + mm["w"]].copy()
+                mm["x"]:mm["x"] + mm["w"]].copy()
                 self.maps.save_minimap(name, self._minimap_snap)
                 self.log("小地图底图缺失，已现场自动补拍并写入地图包", "ok")
             else:
@@ -928,21 +1598,29 @@ class App(tk.Tk):
         self.engine.reload_runtime()
         if self._minimap_snap is not None:
             self.engine.set_nav_base(self._minimap_snap)
-        # 同步 UI 控件
+        self._update_route_label()
         for k, ent in self._key_entries.items():
             ent.var.set(self.cfg["keys"].get(k, "-"))
         self.patrol_var.set(self.cfg.get("patrol", {}).get("enabled", False))
+        # 同步偏移输入框（地图包切换后）
+        cur_off = self.cfg.get("patrol", {}).get("map_offset", [0, 0])
+        if hasattr(self, "_off_x_entry") and isinstance(cur_off, list) \
+                and len(cur_off) == 2:
+            self._off_x_entry.delete(0, "end")
+            self._off_x_entry.insert(0, str(cur_off[0]))
+            self._off_y_entry.delete(0, "end")
+            self._off_y_entry.insert(0, str(cur_off[1]))
         self.refresh_tpl_list()
         self.refresh_maps()
         self.refresh_patrol_label()
-        self.log(f"📦 地图包「{name}」已加载：绑定怪物 "
+        n_routes = self._route_count()
+        self.log(f"📦 配置「{sel}」→ 地图包「{name}」已加载：绑定怪物 "
                  f"{len(self.cfg.get('monster_templates', []))} 个 · "
                  f"底图{'✓' if self._minimap_snap is not None else '✗'} · "
-                 f"路线{'✓' if self._route_img is not None else '✗'} · "
+                 f"路线{n_routes}条 · "
                  f"玩家模板{'✓' if self.cfg.get('player_template') else '✗'}", "ok")
-        if self._route_img is None:
+        if n_routes == 0:
             self.log("路线图缺失：请「🎨 绘制路线」，画完自动存入本地图包", "warn")
-        # 自动绑定窗口
         wt = self.cfg.get("window_title", "")
         if wt and not self.engine.window_bound():
             if self.engine.bind_window(wt):
@@ -951,34 +1629,55 @@ class App(tk.Tk):
                                       fg=GREEN)
 
     def delete_map_pack(self):
-        name = self.maps_combo.get()
-        if not name or not messagebox.askyesno(
-                "删除确认", f"确定删除地图包「{name}」？\n（包内绑定的怪物模板一并删除）",
+        sel = self.maps_combo.get().strip()
+        if not sel:
+            return
+        try:
+            entries = self._map_entries or load_map_entries()
+        except MapConfigError:
+            entries = []
+        entry = find_by_name(sel, entries)
+        pack = entry.package if entry else sel
+
+        if not messagebox.askyesno(
+                "删除确认",
+                f"确定删除地图包「{pack}」？\n"
+                f"（配置名「{sel}」· 包内绑定的怪物模板一并删除）",
                 parent=self):
             return
-        self.maps.delete(name)
-        if self.cfg.get("patrol", {}).get("current_map") == name:
+
+        pack_dir = os.path.join(self.maps.maps_dir, pack)
+        keep, removed = [], []
+        for tpl in self.cfg.get("monster_templates", []):
+            p = tpl.get("path", "")
+            if p and os.path.normcase(p).startswith(os.path.normcase(pack_dir)):
+                removed.append(tpl)
+            else:
+                keep.append(tpl)
+
+        self.maps.delete(pack)
+        if self.cfg.get("patrol", {}).get("current_map") == pack:
             self.cfg["patrol"]["current_map"] = ""
             self.cfg["patrol"]["route_path"] = ""
-            t = self.cfg["monster_templates"].pop()  # 绑定的怪物一并解绑
-
-            p = t.get("path", "")  # t = 被删的模板条目
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                    self.log(f"模板文件已删除: {os.path.basename(p)}", "info")
-                except OSError:
-                    pass
-
             self._minimap_snap = None
+            self._route_imgs = []
             self._route_img = None
+            self.cfg["monster_templates"] = keep
+            for tpl in removed:
+                p = tpl.get("path", "")
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                        self.log(f"模板文件已删除: {os.path.basename(p)}", "info")
+                    except OSError:
+                        pass
             self.cfg_mgr.save()
             self.engine.clear_route()
             self.engine.reload_runtime()
             self.refresh_tpl_list()
         self.refresh_maps()
         self.refresh_patrol_label()
-        self.log(f"地图包「{name}」已删除", "warn")
+        self.log(f"地图包「{pack}」（配置名「{sel}」）已删除", "warn")
 
     def refresh_patrol_label(self):
         p = self.cfg.get("patrol", {})
@@ -1009,6 +1708,36 @@ class App(tk.Tk):
         self.cfg["keys"][key] = v
         self.cfg_mgr.save()
         self.log(f"按键 [{key}] → {v or '(空)'}", "info")
+
+    def _apply_map_offset(self):
+        """地图坐标微调：改动立即写入 config 并热重载 route_nav
+
+        不重启、不重载地图包，下一次定位就用新值。
+        """
+        try:
+            ox = float(self._off_x_entry.get().strip() or 0)
+        except (ValueError, AttributeError):
+            ox = 0.0
+        try:
+            oy = float(self._off_y_entry.get().strip() or 0)
+        except (ValueError, AttributeError):
+            oy = 0.0
+
+        self.cfg.setdefault("patrol", {})["map_offset"] = [ox, oy]
+        self.cfg_mgr.save()
+        # ★ 立即生效
+        self.engine.route_nav.configure(map_offset_x=ox, map_offset_y=oy)
+
+    def _set_timer(self, key, entry):
+        """保存定时按键间隔（秒）"""
+        try:
+            v = int(float(entry.get().strip()))
+            if v < 1:
+                v = 1
+        except (ValueError, AttributeError):
+            v = 180
+        self.cfg.setdefault("timers", {})[key] = v
+        self.cfg_mgr.save()
 
     def start_bot(self, _e=None):
         """▶ 启动挂机：前置校验（绑定窗口/怪物模板）→ 引擎切到 RUNNING"""
@@ -1132,14 +1861,24 @@ class App(tk.Tk):
         """把引擎的标注帧等比缩放到预览画布上显示"""
         img = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
         h, w = img.shape[:2]
-        s = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
-        nw, nh = max(1, int(w * s)), max(1, int(h * s))
+
+        # ★ 尺寸稳定：与上次差异 ≤ 3px 就不重算缩放，避免预览图抖
+        last = getattr(self, "_pv_last", None)
+        if last is None or abs(last[0] - w) > 3 or abs(last[1] - h) > 3:
+            s = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
+            nw, nh = max(1, int(w * s)), max(1, int(h * s))
+            self._pv_last = (w, h, nw, nh)
+        else:
+            _, _, nw, nh = self._pv_last
+
         img = cv2.resize(img, (nw, nh))
         self._pv_photo = ImageTk.PhotoImage(Image.fromarray(img))
         c = self.preview_canvas
         c.delete("all")
-        c.create_rectangle(0, 0, self.PREVIEW_W, self.PREVIEW_H, fill="#0a0c12", outline="")
-        c.create_image((self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2,
+        c.create_rectangle(0, 0, self.PREVIEW_W, self.PREVIEW_H,
+                           fill="#0a0c12", outline="")
+        c.create_image((self.PREVIEW_W - nw) // 2,
+                       (self.PREVIEW_H - nh) // 2,
                        anchor="nw", image=self._pv_photo)
 
     def _poll_log(self):
@@ -1165,3 +1904,31 @@ class App(tk.Tk):
         self.engine.shutdown()
         self.cfg_mgr.save()
         self.destroy()
+
+    def save_keys_to_pack(self):
+        """把按键 + 定时按键 + 攻击方式，写入当前地图包"""
+        name = self.cfg.get("patrol", {}).get("current_map", "")
+        if not name:
+            messagebox.showwarning("提示", "请先加载地图包", parent=self)
+            return
+        try:
+            self.maps.update_profile(name, {
+                "keys": dict(self.cfg["keys"]),
+                "timers": dict(self.cfg.get("timers", {})),
+            })
+            self.log(f"💾 按键配置已保存到地图包「{name}」", "ok")
+        except Exception as e:
+            self.log(f"保存失败: {e}", "error")
+            messagebox.showerror("错误", f"保存失败: {e}", parent=self)
+
+    def read_profile(self, name):
+        """读地图包 profile.json，返回 dict 或 None"""
+        import json
+        path = os.path.join(self.maps_dir, name, "profile.json")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
