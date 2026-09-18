@@ -1,0 +1,16 @@
+# 配置名(name) → 地图包目录名(package)
+# package 是 maps/ 下的子目录名，该目录必须存在 map.png
+# 例：maps/kerning_city/map.png
+
+
+maps:
+- name: 蘑菇山
+  package: 蘑菇山
+- name: 岩山4
+  package: 岩山4
+- name: 东部小山
+  package: 东部小山
+- name: 火焰之地Ⅴ
+  package: 火焰之地Ⅴ
+- name: 南部森林训练场Ⅲ
+  package: 南部森林训练场Ⅲ
