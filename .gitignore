@@ -16,3 +16,11 @@ test*
 /打包指南.md
 /build/
 /.monkeycode/
+/build.bat
+/debug_locate/
+/debug_route/
+/img/
+/output/
+/icon.ico
+/新建文本文档.txt
+/.venv/
