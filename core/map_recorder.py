@@ -47,76 +47,81 @@ def _match_offset(img_a, img_b):
     p2 = kp_b[best.trainIdx].pt
     return int(round(p1[0] - p2[0])), int(round(p1[1] - p2[1]))
 
-def _find_yellow(mini, color_bgr):
-    """找黄点（BGR ±40 容差，比精确匹配稳）
 
-    精确匹配（inRange 上下界相同）对像素级 BGR 漂移太敏感，
-    给 40 的容差后几乎不会漏。
+def _find_marks_mask(mini, player_color):
+    """检测红点 + 黄点，返回二值掩码（255=标记像素）
+
+    严格阈值 + 连通域面积/长宽比/紧凑度过滤，避免误判树叶。
     """
-    c = np.array(color_bgr, dtype=np.int32)
-    lower = np.clip(c - 40, 0, 255).astype(np.uint8)
-    upper = np.clip(c + 40, 0, 255).astype(np.uint8)
-    mask = cv2.inRange(mini, lower, upper)
-    coords = cv2.findNonZero(mask)
-    if coords is None or len(coords) < 4:
-        return None
-    pts = coords.reshape(-1, 2)
-    return (int(pts[:, 0].mean()), int(pts[:, 1].mean()))
-
-def _clean_dots(mini, player_color):
-    """涂掉小地图上的玩家黄点和其它玩家红点（用中值填充，不留黑块）
-
-    ★ v30 修复：
-      · 相比"直接涂黑"，改用**中值填充** → 保留周围地形，不留黑块
-      · 同时处理红点（其它玩家）→ 之前完全没处理
-      · 用整块 mask 判断，不依赖某一帧是否找到黄点
-        → 之前某一帧找不到黄点，那一帧的黄点就原样拼进画布
-
-    参数:
-        mini:          ROI 裁剪后的小地图 BGR
-        player_color:  玩家点 BGR（config.patrol.player_dot_color）
-    返回:
-        清洗后的小地图（BGR）
-    """
-    if mini is None or mini.size == 0:
-        return mini
-    out = mini.copy()
-    mask = np.zeros(mini.shape[:2], np.uint8)
-
-    # ① 黄点：BGR ±40 容差（保留用户当前调校）
-    c = np.array(player_color, dtype=np.int32)
-    lower = np.clip(c - 40, 0, 255).astype(np.uint8)
-    upper = np.clip(c + 40, 0, 255).astype(np.uint8)
-    mask |= cv2.inRange(mini, lower, upper)
-
-    # ② 红点：HSV 检测（红色跨 0°/180°，需要两段）
     hsv = cv2.cvtColor(mini, cv2.COLOR_BGR2HSV)
-    mask |= cv2.inRange(hsv, (0, 130, 100), (10, 255, 255))
-    mask |= cv2.inRange(hsv, (170, 130, 100), (180, 255, 255))
 
-    if not mask.any():
-        return out
+    # 黄点：纯黄（H 22~38，S/V 高）
+    yellow = cv2.inRange(hsv, np.array([22, 180, 180]),
+                         np.array([38, 255, 255]))
+    # 红点：纯红（H 跨 0/180，用两段）
+    red1 = cv2.inRange(hsv, np.array([0, 180, 180]),
+                       np.array([6, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([174, 180, 180]),
+                       np.array([180, 255, 255]))
 
-    # 膨胀一点，覆盖点边缘的抗锯齿像素
-    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    raw = cv2.bitwise_or(yellow, cv2.bitwise_or(red1, red2))
+    if raw.max() == 0:
+        return raw
 
-    # ★ 关键：用中值滤波后的图填充（保留地形），而不是涂黑
-    median = cv2.medianBlur(out, 9)
-    out[mask > 0] = median[mask > 0]
-    return out
+    # 连通域过滤：面积 10~200、长宽比 ≤ 2、紧凑度 ≥ 0.5
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, 8)
+    clean = np.zeros_like(raw)
+    for i in range(1, n):
+        w = int(stats[i, cv2.CC_STAT_WIDTH])
+        h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        if not (10 <= a <= 200):
+            continue
+        if max(w, h) > 2 * max(1, min(w, h)):
+            continue
+        if a < 0.5 * w * h:
+            continue
+        clean[labels == i] = 255
+    return clean
+
+
+def _fill_marks(img, mask, max_iter=64):
+    """迭代邻域填充标记像素（只改标记像素，其他一律不动）
+
+    每轮用 3x3 邻域内非标记像素的均值填充标记边缘，重复到填满。
+    """
+    if mask is None or not mask.any():
+        return img
+    img = img.copy()
+    mask = mask.astype(bool)
+    kernel = np.ones((3, 3), np.float32)
+    kernel[1, 1] = 0.0
+
+    for _ in range(max_iter):
+        if not mask.any():
+            break
+        valid = (~mask).astype(np.float32)
+        cnt = cv2.filter2D(valid, -1, kernel,
+                           borderType=cv2.BORDER_REPLICATE)
+        acc = np.zeros_like(img, dtype=np.float32)
+        for ch in range(3):
+            acc[:, :, ch] = cv2.filter2D(
+                img[:, :, ch].astype(np.float32) * valid, -1, kernel,
+                borderType=cv2.BORDER_REPLICATE)
+        fillable = mask & (cnt > 0)
+        if not fillable.any():
+            break
+        for ch in range(3):
+            img[:, :, ch][fillable] = np.clip(
+                acc[:, :, ch][fillable] / cnt[fillable], 0, 255
+            ).astype(np.uint8)
+        mask[fillable] = False
+    return img
+
 
 # ==================== 录制器 ====================
 class MapRecorder(threading.Thread):
-    """拼图后台线程（复用外部 capture 实例）
-
-    生命周期：
-        rec = MapRecorder(capture=engine.capture, roi=..., player_color=..., log_fn=...)
-        rec.start()
-        ... 用户走一圈 ...
-        rec.stop()
-        rec.join(timeout=2)
-        rec.save(out_path, target_w)   # 保存裁剪后结果
-    """
+    """拼图后台线程（复用外部 capture 实例）"""
 
     def __init__(self, capture, roi, player_color, log_fn):
         super().__init__(daemon=True, name="MapRecorder")
@@ -128,7 +133,8 @@ class MapRecorder(threading.Thread):
         self._stop_flag = False
         self._frame_count = 0
         self._img_map = None                             # 拼接画布
-        self._last_mini = None                           # 上一帧 mini
+        self._mark_mask = None                           # ★ 标记位置（待填充）
+        self._last_mini = None                           # 上一帧（匹配图）
         self._loc_last = None                            # 上帧在画布上的位置
 
     # ---------------- 对外接口 ----------------
@@ -148,15 +154,14 @@ class MapRecorder(threading.Thread):
         return self._img_map
 
     def save(self, out_path, target_w):
-        """保存拼图：宽度对齐到 target_w（居中）+ 上下裁黑边
-
-        参数:
-            out_path:  输出 png 路径
-            target_w:  目标宽度（通常 = ROI 宽度）
-        """
+        """保存拼图：填充残留标记 → 宽度对齐 → 上下裁黑边"""
         if self._img_map is None:
             return False
-        img = self._img_map
+        img = self._img_map.copy()
+
+        # ★ 残留标记（玩家不动/首帧位置）用迭代邻域填充
+        if self._mark_mask is not None and self._mark_mask.any():
+            img = _fill_marks(img, self._mark_mask)
 
         # 宽度裁到 target_w，内容居中
         if target_w > 5 and img.shape[1] > target_w:
@@ -183,7 +188,6 @@ class MapRecorder(threading.Thread):
     # ---------------- 线程主循环 ----------------
     def run(self):
         try:
-            # ★ 不新建 capture，直接用 engine 传入的
             if self._cap is None or not getattr(self._cap, "hwnd", None):
                 self.log("❌ 录制：capture 未绑定窗口", "error")
                 return
@@ -205,25 +209,17 @@ class MapRecorder(threading.Thread):
                     continue
                 self._frame_count += 1
 
-                # ★ v30 修复：涂黄点 + 红点（中值填充，不留黑块）
-                #   旧版用 [py-r:py+r, px-r:px+r] = (0,0,0) 涂黑 → 12×12 黑方块
-                #   且红点完全没处理，黄点某帧找不到就残留
-                mini_cleaned = _clean_dots(mini, self.player_color)
-
-                # 调试：前 5 帧打印涂点情况（每 10 帧打一次也可以，这里先用前 5 帧）
-                if self._frame_count <= 5:
-                    pm = _find_yellow(mini, self.player_color)
-                    if pm is not None:
-                        self.log(f"📷 清理点 (黄 {pm})", "info")
-                    else:
-                        self.log(f"📷 清理点（未找到黄点，仅清红点）", "info")
-
-                mini = mini_cleaned
+                # 标记掩码
+                mask = _find_marks_mask(mini, self.player_color)
+                # 匹配图：标记位置涂黑（只影响 ORB，不影响拼接）
+                mini_match = mini.copy()
+                if mask.max() > 0:
+                    mini_match[mask > 0] = (0, 0, 0)
 
                 if self._img_map is None:
-                    self._init_canvas(mini)
+                    self._init_canvas(mini, mask, mini_match)
                 else:
-                    self._append(mini)
+                    self._append(mini, mask, mini_match)
 
                 # 10 FPS 限速
                 dt = time.time() - t_start
@@ -232,28 +228,37 @@ class MapRecorder(threading.Thread):
         except Exception as e:
             import traceback
             self.log(f"录制异常: {e}\n{traceback.format_exc()}", "error")
-        # ★ 不 close capture（归 engine 管）
 
     # ---------------- 内部实现 ----------------
-    def _init_canvas(self, mini):
-        """首帧：新建画布，mini 放中央"""
+    def _init_canvas(self, mini, mini_mask, mini_match):
+        """首帧：新建画布
+
+        ★ 直接写原图（不涂黑），标记位置记录到 _mark_mask。
+        """
         mh, mw = mini.shape[:2]
         canvas_h, canvas_w = mh * 4, mw * 4
         self._img_map = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        self._mark_mask = np.zeros((canvas_h, canvas_w), dtype=bool)
+
         cx = (canvas_w - mw) // 2
         cy = (canvas_h - mh) // 2
-        self._img_map[cy:cy + mh, cx:cx + mw] = mini
-        self._last_mini = mini.copy()
+        self._img_map[cy:cy + mh, cx:cx + mw] = mini          # ★ 原图
+        if mini_mask.max() > 0:
+            self._mark_mask[cy:cy + mh, cx:cx + mw] = (mini_mask > 0)
+
+        self._last_mini = mini_match.copy()
         self._loc_last = (cx, cy)
         self.log(f"📷 首帧：画布 {canvas_w}x{canvas_h}", "info")
 
-    def _append(self, mini):
-        """后续帧：匹配偏移 → 扩展画布 → 覆盖黑像素"""
-        offset = _match_offset(self._last_mini, mini)
+    def _append(self, mini, mini_mask, mini_match):
+        """后续帧：匹配偏移 → 扩展画布 → 正常写入（含标记）
+
+        标记位置只记录到 _mark_mask，等 save 阶段统一填充。
+        """
+        offset = _match_offset(self._last_mini, mini_match)
         if offset is None:
             return
         dx, dy = offset
-        # 位移 < 2px → 小地图没滚动，跳过
         if abs(dx) < 2 and abs(dy) < 2:
             return
 
@@ -262,7 +267,7 @@ class MapRecorder(threading.Thread):
         ph, pw = mini.shape[:2]
         mh, mw = self._img_map.shape[:2]
 
-        # 画布不够 → 扩展
+        # 画布不够 → 扩展（同步扩展 _mark_mask）
         if new_x < 0 or new_y < 0 or new_x + pw > mw or new_y + ph > mh:
             el = max(0, -new_x + 30)
             et = max(0, -new_y + 30)
@@ -272,15 +277,25 @@ class MapRecorder(threading.Thread):
             new_canvas = np.zeros((nh, nw, 3), dtype=np.uint8)
             new_canvas[et:et + mh, el:el + mw] = self._img_map
             self._img_map = new_canvas
+
+            new_mark = np.zeros((nh, nw), dtype=bool)
+            new_mark[et:et + mh, el:el + mw] = self._mark_mask
+            self._mark_mask = new_mark
+
             new_x += el
             new_y += et
             self._loc_last = (self._loc_last[0] + el, self._loc_last[1] + et)
 
-        # 只覆盖画布上的"黑色像素"
+        # 只覆盖画布上的"黑色像素"（未填充区域），原图直接写入
         slice_region = self._img_map[new_y:new_y + ph, new_x:new_x + pw]
+        slice_mark = self._mark_mask[new_y:new_y + ph, new_x:new_x + pw]
         if slice_region.shape[0] == ph and slice_region.shape[1] == pw:
             black = np.all(slice_region == [0, 0, 0], axis=2)
+            cur_mark = mini_mask > 0
+            # 写原图（含标记），不跳过任何像素
             slice_region[black] = mini[black]
+            # 更新标记掩码：写入位置的标记状态 = 当前帧该位置是否标记
+            slice_mark[black] = cur_mark[black]
 
-        self._last_mini = mini.copy()
+        self._last_mini = mini_match.copy()
         self._loc_last = (new_x, new_y)
