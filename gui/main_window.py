@@ -36,14 +36,12 @@ from core.hotkey_manager import HotkeyManager
 from gui.theme import *
 from gui.widgets import NeoButton, Bar, KeyEntry, ScrollFrame
 from gui.region_selector import RegionSelector
-# from gui.route_editor import RouteEditor
-# from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
 from core.bot_engine import BotEngine, Mode
 from core.window_capture import WindowCapture, VncCapture, FastWindowCapture
 from gui.route_painter import RoutePainter
 from core.map_manager import MapManager
 from core.config_manager import ConfigManager, TEMPLATE_DIR, ROOT
-from core.imio import imread_u, imwrite_u
+from core.imio import  imwrite_u
 from core.map_config import (
     load_map_entries, find_by_name, find_by_package, MapConfigError,
 )

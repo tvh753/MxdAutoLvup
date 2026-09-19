@@ -86,6 +86,21 @@ class MapManager:
             return []
         return [f for f in sorted(os.listdir(d)) if f.lower().endswith(".png")]
 
+    def create(self, name):
+        """创建空地图包目录（同时写 config_map.yaml）"""
+        pack_dir = os.path.join(self.maps_dir, name)
+        if os.path.isdir(pack_dir):
+            return False
+        os.makedirs(pack_dir, exist_ok=True)
+        os.makedirs(os.path.join(pack_dir, "monsters"), exist_ok=True)
+        profile_path = os.path.join(pack_dir, "profile.json")
+        if not os.path.isfile(profile_path):
+            with open(profile_path, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=2)
+        # ★ 同步写入 config_map.yaml
+        self.add_yaml_entry(name)
+        return True
+
     # ---------------- 保存地图包 ----------------
     def save(self, name, cfg, minimap_img, route_img, grab_fn=None):
         """把当前配置 + 底图 + 路线 + 怪物模板打包成地图包
@@ -242,41 +257,6 @@ class MapManager:
             missing.append("minimap.png(小地图底图)")
         return True, missing
 
-    # ---------------- 图片存取（imio 中文路径安全） ----------------
-    def load_minimap(self, name):
-        """读取地图包的小地图底图（中文路径安全）"""
-        return imread_u(self._path(name, "minimap.png"))
-
-    def load_route(self, name):
-        """读取地图包的颜色路线图
-
-        v27 返回列表（长度 ≥1）或 None：
-          · 优先扫 route1.png / route2.png / ...（多路线）
-          · 退而求其次读 route.png（单条，兼容旧包）
-        """
-        import glob as _glob
-        d = self._path(name)
-        # 优先多路线
-        multi = _glob.glob(os.path.join(d, "route[0-9]*.png"))
-        if multi:
-            # 按数字排序（route1 < route2 < route10）
-            def _key(p):
-                base = os.path.basename(p)
-                num = base[5:-4]
-                return int(num) if num.isdigit() else 0
-            multi.sort(key=_key)
-            imgs = [imread_u(p) for p in multi]
-            imgs = [img for img in imgs if img is not None]
-            if imgs:
-                return imgs
-        # 退回单条
-        single = imread_u(os.path.join(d, "route.png"))
-        return [single] if single is not None else None
-
-    def save_minimap(self, name, img):
-        """写入小地图底图，成功返回 True"""
-        return img is not None and imwrite_u(self._path(name, "minimap.png"), img)
-
     def save_route(self, name, route_img):
         """写入颜色路线图，成功返回 True
 
@@ -316,6 +296,41 @@ class MapManager:
             if not imwrite_u(self._path(name, f"route{i}.png"), img):
                 ok = False
         return ok
+
+    # ---------------- 图片存取（imio 中文路径安全） ----------------
+    def load_minimap(self, name):
+        """读取地图包的小地图底图（中文路径安全）"""
+        return imread_u(self._path(name, "minimap.png"))
+
+    def load_route(self, name):
+        """读取地图包的颜色路线图
+
+        v27 返回列表（长度 ≥1）或 None：
+          · 优先扫 route1.png / route2.png / ...（多路线）
+          · 退而求其次读 route.png（单条，兼容旧包）
+        """
+        import glob as _glob
+        d = self._path(name)
+        # 优先多路线
+        multi = _glob.glob(os.path.join(d, "route[0-9]*.png"))
+        if multi:
+            # 按数字排序（route1 < route2 < route10）
+            def _key(p):
+                base = os.path.basename(p)
+                num = base[5:-4]
+                return int(num) if num.isdigit() else 0
+            multi.sort(key=_key)
+            imgs = [imread_u(p) for p in multi]
+            imgs = [img for img in imgs if img is not None]
+            if imgs:
+                return imgs
+        # 退回单条
+        single = imread_u(os.path.join(d, "route.png"))
+        return [single] if single is not None else None
+
+    def save_minimap(self, name, img):
+        """写入小地图底图，成功返回 True"""
+        return img is not None and imwrite_u(self._path(name, "minimap.png"), img)
 
     def update_profile(self, name, updates):
         """部分更新地图包 profile.json（深合并）
@@ -436,20 +451,6 @@ class MapManager:
         except Exception:
             return None
 
-    def create(self, name):
-        """创建空地图包目录（同时写 config_map.yaml）"""
-        pack_dir = os.path.join(self.maps_dir, name)
-        if os.path.isdir(pack_dir):
-            return False
-        os.makedirs(pack_dir, exist_ok=True)
-        os.makedirs(os.path.join(pack_dir, "monsters"), exist_ok=True)
-        profile_path = os.path.join(pack_dir, "profile.json")
-        if not os.path.isfile(profile_path):
-            with open(profile_path, "w", encoding="utf-8") as f:
-                json.dump({}, f, indent=2)
-        # ★ 同步写入 config_map.yaml
-        self.add_yaml_entry(name)
-        return True
 
     def delete(self, name):
         """删除整个地图包目录 + 从 config_map.yaml 移除"""
