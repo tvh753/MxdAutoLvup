@@ -129,7 +129,17 @@ class MapManager:
             raise IOError(f"小地图底图写入失败: {d}")
         # ② 路线图：有新图才写；None 时保留包内旧图（重存不洗掉路线）
         #    v27: route_img 可为单张或列表，交给 save_route 统一处理
+        #
+        # ★ v28 修复：空列表 [] 在 Python 里 is not None → True，
+        #   会误进分支，然后 save_route 收到空列表返回 False →
+        #   被当成"路线写入失败"。这里显式判断"是否真的有路线"。
+        has_route = False
         if route_img is not None:
+            if isinstance(route_img, list):
+                has_route = any(r is not None for r in route_img)
+            else:
+                has_route = True
+        if has_route:
             if not self.save_route(name, route_img):
                 raise IOError(f"路线图写入失败: {d}")
         # ③ 怪物绑定：当前配置模板 → 拷入包内，统一指向包内路径
@@ -279,7 +289,9 @@ class MapManager:
         else:
             imgs = [route_img]
         if not imgs:
-            return False
+            # ★ v28 修复：空列表不是"写入失败"，只是"没有路线要写"
+            #   返回 True 表示"没有错误发生"，让上层正确处理
+            return True
 
         # 清理旧的 route*.png（避免与旧文件混存）
         for old in _glob.glob(os.path.join(d, "route*.png")):
