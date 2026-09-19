@@ -1219,25 +1219,46 @@ class App(tk.Tk):
     def _quick_snapshot(self):
         """校准后抓一帧小地图，直接作为 map.png
 
-        适用于"小地图显示整张地图"的情况（火焰之地V、蘑菇山等）。
+        适用于"小地图显示整张地图"的情况（火焰之地Ⅴ、蘑菇山等）。
         滚动小地图请用「🎬 录制小地图」走一圈。
+
+        ★ v29 修复：目标目录从下拉框解析，而不是 current_map
         """
-        name = self.cfg.get("patrol", {}).get("current_map", "")
+        # ★ 与 record_minimap 一致：优先用下拉框
+        sel = self.maps_combo.get().strip()
+        if sel:
+            try:
+                entries = self._map_entries or load_map_entries()
+            except MapConfigError:
+                entries = []
+            entry = find_by_name(sel, entries)
+            name = entry.package if entry else sel
+        else:
+            name = self.cfg.get("patrol", {}).get("current_map", "")
+
         if not name:
             return
+
+        # 目录不存在 → 静默跳过（不打断校准流程，用户后续可以保存地图包）
+        pack_dir = os.path.join(self.maps.maps_dir, name)
+        if not os.path.isdir(pack_dir):
+            self.log(f"⚠ 地图包「{name}」目录不存在，跳过快照", "warn")
+            return
+
         mm = self.cfg.get("patrol", {}).get("minimap", {})
         if mm.get("w", 0) < 5:
             return
+
         frame = self._grab_frame()
         if frame is None:
             return
         mini = frame[mm["y"]:mm["y"] + mm["h"],
                      mm["x"]:mm["x"] + mm["w"]].copy()
-        out = os.path.join(self.maps.maps_dir, name, "map.png")
+        out = os.path.join(pack_dir, "map.png")
         ok, buf = cv2.imencode(".png", mini)
         if ok:
             buf.tofile(out)
-            self.log(f"📸 已快照小地图为 map.png（{mm['w']}x{mm['h']}）", "ok")
+            self.log(f"📸 已快照小地图为 map.png（{mm['w']}x{mm['h']}）→ {name}", "ok")
             self.engine.invalidate_route_cache()
             self.engine.reload_runtime()
         else:
@@ -1247,14 +1268,58 @@ class App(tk.Tk):
         """录制小地图（滚动拼图，用于小地图会滚动的长地图）
 
         走一圈 → 拼成大图 → 写入 map.png
+
+        ★ v29 修复：目标目录从「下拉框选中的配置名」解析，
+           而不是 cfg.patrol.current_map（后者只在"加载过"时才更新）。
+           这样"新建地图包 → 校准 → 录制"可以直接工作。
         """
         if not self.engine.window_bound():
             messagebox.showwarning("提示", "请先绑定游戏窗口", parent=self)
             return
-        name = self.cfg.get("patrol", {}).get("current_map", "")
+
+        # ★ 修复：优先从下拉框取配置名 → 解析成 package 目录名
+        sel = self.maps_combo.get().strip()
+        if sel:
+            try:
+                entries = self._map_entries or load_map_entries()
+            except MapConfigError:
+                entries = []
+            entry = find_by_name(sel, entries)
+            name = entry.package if entry else sel
+        else:
+            # 下拉框空 → 回退到 current_map（兼容旧行为）
+            name = self.cfg.get("patrol", {}).get("current_map", "")
+
         if not name:
-            messagebox.showwarning("提示", "请先加载地图包", parent=self)
+            messagebox.showwarning("提示", "请先选择/加载地图包", parent=self)
             return
+
+        # ★ 校验目标目录存在；不存在时提示创建（否则录制完无处可存）
+        pack_dir = os.path.join(self.maps.maps_dir, name)
+        if not os.path.isdir(pack_dir):
+            if messagebox.askyesno(
+                    "地图包不存在",
+                    f"地图包「{name}」目录不存在：\n{pack_dir}\n\n"
+                    f"是否现在创建？（会自动写入 profile.json 并登记 config_map.yaml）",
+                    parent=self):
+                try:
+                    os.makedirs(pack_dir, exist_ok=True)
+                    os.makedirs(os.path.join(pack_dir, "monsters"), exist_ok=True)
+                    prof_path = os.path.join(pack_dir, "profile.json")
+                    if not os.path.isfile(prof_path):
+                        import json as _json
+                        with open(prof_path, "w", encoding="utf-8") as f:
+                            _json.dump({}, f, indent=2)
+                    try:
+                        self.maps.add_yaml_entry(sel or name, package=name)
+                    except Exception as e:
+                        self.log(f"config_map.yaml 写入失败: {e}", "warn")
+                except Exception as e:
+                    messagebox.showerror("错误", f"创建失败: {e}", parent=self)
+                    return
+            else:
+                return
+
         mm = self.cfg.get("patrol", {}).get("minimap", {})
         if mm.get("w", 0) < 5:
             messagebox.showwarning("提示", "请先「校准小地图」", parent=self)
@@ -1265,12 +1330,12 @@ class App(tk.Tk):
         roi = (mm["x"], mm["y"], mm["w"], mm["h"])
         color = self.cfg.get("patrol", {}).get("player_dot_color", [0, 128, 255])
         self._recorder = MapRecorder(
-            capture=self.engine.capture,   # ★ 复用 engine 的
+            capture=self.engine.capture,   # 复用 engine 的
             roi=roi,
             player_color=color,
             log_fn=self.log)
         self._recorder.start()
-        self._recorder_pack = name
+        self._recorder_pack = name          # ★ 用解析后的目录名
         self._recorder_target_w = int(mm["w"])
 
         self._rec_dialog = tk.Toplevel(self)
@@ -1278,13 +1343,14 @@ class App(tk.Tk):
         self._rec_dialog.configure(bg=PANEL)
         self._rec_dialog.geometry("320x160")
         self._rec_dialog.transient(self)
-        # ★ 不用 grab_set，避免阻塞主循环
 
         tk.Label(self._rec_dialog, text="🎬 录制中…",
                  bg=PANEL, fg=ACCENT, font=(FONT, 12, "bold")).pack(pady=(15, 5))
         self._rec_info = tk.Label(self._rec_dialog,
-                                   text="请在游戏里走一圈，把地图走遍",
-                                   bg=PANEL, fg=TEXT, font=(FONT, 10))
+                                   text=f"目标地图包：{name}\n"
+                                        f"请在游戏里走一圈，把地图走遍",
+                                   bg=PANEL, fg=TEXT, font=(FONT, 10),
+                                   justify="left")
         self._rec_info.pack(pady=5)
 
         btn_row = tk.Frame(self._rec_dialog, bg=PANEL)
