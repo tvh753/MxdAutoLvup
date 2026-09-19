@@ -63,6 +63,48 @@ def _find_yellow(mini, color_bgr):
     pts = coords.reshape(-1, 2)
     return (int(pts[:, 0].mean()), int(pts[:, 1].mean()))
 
+def _clean_dots(mini, player_color):
+    """涂掉小地图上的玩家黄点和其它玩家红点（用中值填充，不留黑块）
+
+    ★ v30 修复：
+      · 相比"直接涂黑"，改用**中值填充** → 保留周围地形，不留黑块
+      · 同时处理红点（其它玩家）→ 之前完全没处理
+      · 用整块 mask 判断，不依赖某一帧是否找到黄点
+        → 之前某一帧找不到黄点，那一帧的黄点就原样拼进画布
+
+    参数:
+        mini:          ROI 裁剪后的小地图 BGR
+        player_color:  玩家点 BGR（config.patrol.player_dot_color）
+    返回:
+        清洗后的小地图（BGR）
+    """
+    if mini is None or mini.size == 0:
+        return mini
+    out = mini.copy()
+    mask = np.zeros(mini.shape[:2], np.uint8)
+
+    # ① 黄点：BGR ±40 容差（保留用户当前调校）
+    c = np.array(player_color, dtype=np.int32)
+    lower = np.clip(c - 40, 0, 255).astype(np.uint8)
+    upper = np.clip(c + 40, 0, 255).astype(np.uint8)
+    mask |= cv2.inRange(mini, lower, upper)
+
+    # ② 红点：HSV 检测（红色跨 0°/180°，需要两段）
+    hsv = cv2.cvtColor(mini, cv2.COLOR_BGR2HSV)
+    mask |= cv2.inRange(hsv, (0, 130, 100), (10, 255, 255))
+    mask |= cv2.inRange(hsv, (170, 130, 100), (180, 255, 255))
+
+    if not mask.any():
+        return out
+
+    # 膨胀一点，覆盖点边缘的抗锯齿像素
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    # ★ 关键：用中值滤波后的图填充（保留地形），而不是涂黑
+    median = cv2.medianBlur(out, 9)
+    out[mask > 0] = median[mask > 0]
+    return out
+
 # ==================== 录制器 ====================
 class MapRecorder(threading.Thread):
     """拼图后台线程（复用外部 capture 实例）
@@ -163,21 +205,20 @@ class MapRecorder(threading.Thread):
                     continue
                 self._frame_count += 1
 
-                # 涂黄点（首帧和后续都涂）
-                pm = _find_yellow(mini, self.player_color)
-                if pm is not None:
-                    px, py = pm
-                    r = 6
-                    mini[max(0, py - r):min(mini.shape[0], py + r),
-                         max(0, px - r):min(mini.shape[1], px + r)] = (0, 0, 0)
-                    if self._frame_count <= 3:
-                        self.log(f"📷 涂黄点 ({px},{py})", "info")
-                else:
-                    if self._frame_count <= 3:
-                        self.log(f"⚠ 未找到黄点 颜色={self.player_color}",
-                                 "warn")
+                # ★ v30 修复：涂黄点 + 红点（中值填充，不留黑块）
+                #   旧版用 [py-r:py+r, px-r:px+r] = (0,0,0) 涂黑 → 12×12 黑方块
+                #   且红点完全没处理，黄点某帧找不到就残留
+                mini_cleaned = _clean_dots(mini, self.player_color)
 
+                # 调试：前 5 帧打印涂点情况（每 10 帧打一次也可以，这里先用前 5 帧）
+                if self._frame_count <= 5:
+                    pm = _find_yellow(mini, self.player_color)
+                    if pm is not None:
+                        self.log(f"📷 清理点 (黄 {pm})", "info")
+                    else:
+                        self.log(f"📷 清理点（未找到黄点，仅清红点）", "info")
 
+                mini = mini_cleaned
 
                 if self._img_map is None:
                     self._init_canvas(mini)
