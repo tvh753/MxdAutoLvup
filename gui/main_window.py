@@ -827,6 +827,20 @@ class App(tk.Tk):
         pack_dir = os.path.join(self.maps.maps_dir, name)
         self.refresh_maps()                 # ★ 刷新下拉列表（读 yaml）
         self.maps_combo.set(name)           # 自动选中新建的
+
+        # ★ v29 修复：新建地图包后，清空"属于其它地图包"的怪物列表
+        #   理由：这些怪不属于新包，保留在 UI 里会误导用户以为它们属于新包，
+        #         保存时也会意外被拷进新包（哪怕有过滤，UI 里显示也不对）
+        kept, dropped = self._filter_monsters_for_pack(name)
+        if dropped:
+            self.cfg["monster_templates"] = kept
+            self.cfg_mgr.save()
+            self.refresh_tpl_list()
+            self.engine.reload_runtime()
+            names = "、".join(t.get("name", "?") for t in dropped[:5])
+            more = f" 等{len(dropped)}个" if len(dropped) > 5 else ""
+            self.log(f"🧹 已清空旧地图包怪物：{names}{more}（不属于新地图）", "info")
+
         self.log(f"📦 地图包「{name}」已创建：{pack_dir}", "ok")
         messagebox.showinfo(
             "创建成功",
@@ -1503,6 +1517,38 @@ class App(tk.Tk):
                 text=f"路线: {n} 条",
                 fg=TEXT if n > 0 else TEXT_DIM)
 
+    def _filter_monsters_for_pack(self, pack_name):
+        """过滤 cfg.monster_templates：只保留"属于目标地图包"或"不属于任何地图包"的怪
+
+        背景：cfg.monster_templates 是全局的，不会随地图包切换自动清空。
+        如果不过滤，用户在 A 图加载后再新建 B 图保存，会把 A 的怪拷进 B。
+
+        规则：
+          · 路径在目标包目录内        → 保留（本包已有的怪）
+          · 路径不在任何地图包目录内  → 保留（暂存区、用户刚框选的）
+          · 路径在其它地图包目录内    → 丢弃（其它包的怪）
+
+        返回：(保留列表, 丢弃列表)
+        """
+        maps_dir = os.path.normcase(os.path.abspath(self.maps.maps_dir))
+        target_prefix = os.path.normcase(os.path.abspath(
+            os.path.join(self.maps.maps_dir, pack_name))) + os.sep
+
+        kept, dropped = [], []
+        for t in self.cfg.get("monster_templates", []):
+            p = t.get("path", "")
+            if not p or not os.path.isfile(p):
+                dropped.append(t)
+                continue
+            p_norm = os.path.normcase(os.path.abspath(p))
+            if p_norm.startswith(target_prefix):
+                kept.append(t)                    # 属于目标包
+            elif not p_norm.startswith(maps_dir + os.sep):
+                kept.append(t)                    # 不在任何包内（暂存区 / 刚框选）
+            else:
+                dropped.append(t)                 # 属于其它包 → 丢弃
+        return kept, dropped
+
     def save_map_pack(self):
         """保存当前配置到地图包。
 
@@ -1539,6 +1585,18 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先「🧭 校准小地图」再保存地图包",
                                    parent=self)
             return
+        # ★ v29 修复：保存前过滤怪物列表 —— 只保留"本包"和"暂存区"的怪
+        #   避免把其它地图包的怪拷贝进来
+        orig_monsters = self.cfg.get("monster_templates", []) or []
+        kept, dropped = self._filter_monsters_for_pack(pack)
+        if dropped:
+            # 有被丢弃的 → 提示用户（非模态，只写日志 + 一个轻提示）
+            names = "、".join(t.get("name", "?") for t in dropped[:5])
+            more = f" 等{len(dropped)}个" if len(dropped) > 5 else ""
+            self.log(f"⚠ 以下怪物不属于「{pack}」，保存时已忽略：{names}{more}", "warn")
+        # 临时替换 cfg.monster_templates，让 save() 只处理要保留的
+        self.cfg["monster_templates"] = kept
+
         try:
             # ★ 保证 config_map.yaml 里有这个目录（老包补录）
             try:
@@ -1548,9 +1606,13 @@ class App(tk.Tk):
             self.maps.save(pack, self.cfg, self._minimap_snap, self._route_imgs,
                            grab_fn=lambda: self._grab_frame())
         except Exception as e:
+            # ★ 出错时恢复原列表，避免状态不一致
+            self.cfg["monster_templates"] = orig_monsters
             self.log(f"地图包保存失败: {e}", "error")
             messagebox.showerror("错误", f"地图包保存失败：{e}", parent=self)
             return
+        # ★ 保存成功后保持过滤后的列表（load_map_pack 会从 profile 重新读）
+        self.refresh_tpl_list()
 
         # 回填
         mm_img = self.maps.load_minimap(pack)
